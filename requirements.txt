@@ -1,2 +1,2 @@
-customtkinter>=5.0.0
+customtkinter>=5.2.0
 send2trash>=1.8.0

@@ -1,10 +1,13 @@
 """
-Localization module for multi-language support.
+Internacionalización (i18n) de la interfaz.
+
+Expone el diccionario LOCALIZATION (es/en) y una pequeña clase
+Translator que centraliza el acceso seguro a las claves de traducción,
+con fallback a la clave bruta y formateo con kwargs protegido.
 """
+from __future__ import annotations
 
-from typing import Dict
-
-LOCALIZATION: Dict[str, Dict[str, str]] = {
+LOCALIZATION = {
     "es": {
         "titulo": "Organizador Inteligente v18.3 - Edición Concurrente Premium",
         "tab_sincro": " Sincronización ",
@@ -41,7 +44,7 @@ LOCALIZATION: Dict[str, Dict[str, str]] = {
         "rad_col_omit": "Omitir si ya existe en destino",
         "tit_rangos": "▼ LIMITACIÓN POR RANGOS DE TAMAÑO (MB)",
         "lbl_tam_min": "Tamaño Mínimo (MB):",
-        "lbl_tam_max": "Tamaño Máximo (MB):",
+        "lbl_tam_max": "Tamaño Maximó (MB):",
         "wizard_regex_clean": "Limpieza RegEx -> Buscar:",
         "wizard_regex_repl": "Reemplazar por:",
         "lbl_metodo_borrado": "Método de eliminación de duplicados:",
@@ -61,19 +64,13 @@ LOCALIZATION: Dict[str, Dict[str, str]] = {
         "disk_saving_real": "Espacio liberable: {megas:.2f} MB.\nVerde = Se queda | Rojo = Se elimina / va a papelera",
         "disk_saving_init": "Espacio liberable estimado: 0.00 MB [Entorno Seguro]",
         "msg_dry_title": "Simulación Dry Run",
-        "msg_dry_body": "Simulación finalizada. Se habrían procesado {ficheros} duplicados ({megas:.2f} MB).",
+        "msg_dry_body": "Simulación finalizada. Se habrían processed {ficheros} duplicados ({megas:.2f} MB).",
         "msg_real_title": "Limpieza Completada",
         "msg_real_body": "Operación completada. Se eliminaron {ficheros} archivos duplicados reales de forma efectiva, liberando {megas:.2f} MB.",
         "tit_apariencia": "▼ PANEL DE APARIENCIA Y ENTORNO VISUAL",
         "lbl_modo_color": "Tema de Interfaz:",
         "lbl_color_acento": "Acento Hex Manual:",
-        "lbl_color_paneles": "Marcos Hex Manual:",
-        "error_title": "Error",
-        "warning_title": "Advertencia",
-        "success_title": "Éxito",
-        "invalid_paths": "Por favor, defina rutas de origen y destino válidas.",
-        "no_duplicates": "No se encontraron duplicados.",
-        "confirm_purge": "¿Eliminar definitivamente todo el registro histórico?",
+        "lbl_color_paneles": "Marcos Hex Manual:"
     },
     "en": {
         "titulo": "Smart Organizer v18.3 - Concurrent Premium Edition",
@@ -94,7 +91,7 @@ LOCALIZATION: Dict[str, Dict[str, str]] = {
         "lbl_estado_off": "Status: Off",
         "lbl_estado_on": "Status: Active...",
         "btn_add_ruta": "➕ Add",
-        "btn_del_ruta": "➖ Remove",
+        "btn_del_ruta": "REMOVE",
         "chk_dup_tamano": "Identical Size Filter",
         "chk_dup_nombre": "Identical Name Filter",
         "btn_analizar_dup": "🔍 Scan Duplicates",
@@ -137,52 +134,30 @@ LOCALIZATION: Dict[str, Dict[str, str]] = {
         "tit_apariencia": "▼ APPEARANCE & VISUAL STYLE CONFIG",
         "lbl_modo_color": "Interface Theme:",
         "lbl_color_acento": "Manual Accent Hex:",
-        "lbl_color_paneles": "Manual Frame Hex:",
-        "error_title": "Error",
-        "warning_title": "Warning",
-        "success_title": "Success",
-        "invalid_paths": "Please define valid source and destination paths.",
-        "no_duplicates": "No duplicates found.",
-        "confirm_purge": "Permanently delete all history records?",
-    },
+        "lbl_color_paneles": "Manual Frame Hex:"
+    }
 }
 
+class Translator:
+    """Acceso seguro a las cadenas localizadas.
 
-class Localizer:
-    """Handle localization and translation."""
+    Si la clave no existe, se devuelve la propia clave en vez de lanzar
+    una excepción, para que la interfaz nunca quede en blanco por un
+    error de traducción.
+    """
 
-    def __init__(self, language: str = "es"):
-        self.language = language
+    def __init__(self, lang: str = "es"):
+        self.lang = lang if lang in LOCALIZATION else "es"
 
-    def get(self, key: str, **kwargs) -> str:
-        """Get translated string.
+    def set_language(self, lang: str) -> None:
+        self.lang = lang if lang in LOCALIZATION else "es"
 
-        Args:
-            key: Translation key
-            **kwargs: Format parameters
-
-        Returns:
-            Translated and formatted string
-        """
-        translations = LOCALIZATION.get(self.language, LOCALIZATION["es"])
-        text = translations.get(key, key)
-
-        if kwargs:
-            try:
-                return text.format(**kwargs)
-            except KeyError as e:
-                return f"{text} [Missing param: {e}]"
-
-        return text
-
-    def set_language(self, language: str) -> None:
-        """Set current language."""
-        if language in LOCALIZATION:
-            self.language = language
-
-    def get_available_languages(self) -> Dict[str, str]:
-        """Get available languages."""
-        return {
-            "es": "Español",
-            "en": "English",
-        }
+    def __call__(self, clave: str, **kwargs) -> str:
+        tabla = LOCALIZATION.get(self.lang, LOCALIZATION["es"])
+        plantilla = tabla.get(clave, clave)
+        if not kwargs:
+            return plantilla
+        try:
+            return plantilla.format(**kwargs)
+        except (KeyError, IndexError, ValueError):
+            return plantilla

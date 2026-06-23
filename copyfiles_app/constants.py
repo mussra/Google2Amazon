@@ -53,5 +53,5 @@ PALETAS_PREDEFINIDAS: dict[str, dict] = {
 
 DEFAULT_RENAME_TOKENS = [
     "{año}", "{mes}", "{dia}", "{nombre_origen}", "{secuencial}",
-    "{usuario}", "{equipo}", "{directorio}",
+    "{usuario}", "{equipo}", "{directorio}", "{ruta_relativa}",
 ]

@@ -410,22 +410,29 @@ class CopyFilesApp:
             ctk.CTkButton(f_tokens, text=tk_s, width=60, height=22, font=("Consolas", 10),
                           command=lambda t=tk_s: self._inyectar_token_wizard(t)).pack(side="left", padx=2)
 
+        ctk.CTkLabel(
+            f_wizard,
+            text="💡 {ruta_relativa} replica la estructura completa desde el origen. "
+                 "Ej: origen=folder1 → destino/folder1/folder2/imagen.jpg",
+            font=("Segoe UI", 9), text_color="#888888",
+        ).grid(row=3, column=0, columnspan=2, padx=15, pady=(0, 2), sticky="w")
+
         self.wizard_regex_clean = ctk.CTkLabel(f_wizard, text=self.t("wizard_regex_clean"))
-        self.wizard_regex_clean.grid(row=3, column=0, padx=15, pady=5, sticky="w")
+        self.wizard_regex_clean.grid(row=4, column=0, padx=15, pady=5, sticky="w")
         ent_w_b = ctk.CTkEntry(f_wizard, textvariable=self.ren_regex_busca_var, width=180)
-        ent_w_b.grid(row=3, column=1, padx=15, pady=5, sticky="w")
+        ent_w_b.grid(row=4, column=1, padx=15, pady=5, sticky="w")
         ent_w_b.bind("<KeyRelease>", lambda e: self._evaluar_preview_wizard())
 
         self.wizard_regex_repl = ctk.CTkLabel(f_wizard, text=self.t("wizard_regex_repl"))
-        self.wizard_regex_repl.grid(row=4, column=0, padx=15, pady=5, sticky="w")
+        self.wizard_regex_repl.grid(row=5, column=0, padx=15, pady=5, sticky="w")
         ent_w_r = ctk.CTkEntry(f_wizard, textvariable=self.ren_regex_reemplaza_var, width=180)
-        ent_w_r.grid(row=4, column=1, padx=15, pady=5, sticky="w")
+        ent_w_r.grid(row=5, column=1, padx=15, pady=5, sticky="w")
         ent_w_r.bind("<KeyRelease>", lambda e: self._evaluar_preview_wizard())
 
         self.wizard_preview = ctk.CTkLabel(f_wizard, text=self.t("wizard_preview"), font=("Segoe UI", 10, "bold"))
-        self.wizard_preview.grid(row=5, column=0, padx=15, pady=5, sticky="w")
+        self.wizard_preview.grid(row=6, column=0, padx=15, pady=5, sticky="w")
         ctk.CTkLabel(f_wizard, textvariable=self.lbl_preview_var, font=("Consolas", 11, "italic"),
-                     text_color="#0d6efd").grid(row=5, column=1, padx=15, pady=5, sticky="w")
+                     text_color="#0d6efd").grid(row=6, column=1, padx=15, pady=5, sticky="w")
 
         f_limpieza_dup = ctk.CTkFrame(self.scrollable_frame_avanzado)
         f_limpieza_dup.pack(fill="x", padx=15, pady=5)
@@ -634,7 +641,18 @@ class CopyFilesApp:
         self.contador_archivos = 0
         self.bytes_processed = 0
         self.progress_bar.set(0)
-        self.sync_engine = SyncEngine(cfg, self._agregar_log, self._actualizar_progreso, history=self.history)
+        def _on_sync_finished():
+            def _ui():
+                self.btn_lanzar.configure(
+                    text=self.t("btn_lanzar"), fg_color="#1b5e20", hover_color="#2e7d32")
+                self.lbl_estado.configure(text=self.t("lbl_estado_off"))
+                self.progress_bar.set(1.0)
+            self.root.after(0, _ui)
+
+        self.sync_engine = SyncEngine(
+            cfg, self._agregar_log, self._actualizar_progreso,
+            history=self.history, on_finished=_on_sync_finished,
+        )
         self.sync_engine.activo = True
         self.btn_lanzar.configure(text=self.t("btn_detener"), fg_color="#b71c1c", hover_color="#c62828")
         self.lbl_estado.configure(text=self.t("lbl_estado_on"))
@@ -842,11 +860,16 @@ class CopyFilesApp:
         for padre in self.tree_dup.get_children():
             for hijo in self.tree_dup.get_children(padre):
                 valores = self.tree_dup.item(hijo, "values")
-                if valores and valores[2] in ("ELIMINAR", "DELETE"):
-                    try:
-                        total_bytes += float(valores[1].split()[0]) * 1024 * 1024
-                    except (ValueError, IndexError):
-                        continue
+                if not valores or len(valores) < 3:
+                    continue
+                if valores[2] not in ("ELIMINAR", "DELETE"):
+                    continue
+                try:
+                    # valores[1] es "X.XX MB" — extraer el número
+                    mb_val = float(str(valores[1]).split()[0])
+                    total_bytes += mb_val * 1024 * 1024
+                except (ValueError, IndexError):
+                    continue
         mb = total_bytes / (1024 * 1024)
         clave = "disk_saving_dry" if self.dry_run_var.get() else "disk_saving_real"
         self.lbl_saving_dup.configure(text=self.t(clave, megas=mb))
@@ -873,12 +896,19 @@ class CopyFilesApp:
         item_id = self.tree_dup.identify_row(event.y)
         if not item_id:
             return
+        # Ignorar filas padre (no tienen parent)
+        if not self.tree_dup.parent(item_id):
+            return
         valores = self.tree_dup.item(item_id, "values")
-        if not valores or valores[2] == "Grupo":
+        if not valores or len(valores) < 3:
+            return
+        accion_actual = valores[2]
+        if accion_actual == "Grupo":
             return
 
-        nueva_accion = "MANTENER" if valores[2] == "ELIMINAR" else "ELIMINAR"
-        self.tree_dup.set(item_id, "Acción", nueva_accion)
+        nueva_accion = "MANTENER" if accion_actual == "ELIMINAR" else "ELIMINAR"
+        # Usar índice de columna en lugar de nombre con tilde (más robusto cross-platform)
+        self.tree_dup.set(item_id, column=2, value=nueva_accion)
         self.tree_dup.item(item_id, tags=("tag_mantener" if nueva_accion == "MANTENER" else "tag_eliminar",))
         self._recalcular_ahorro_espacio()
 
@@ -891,10 +921,12 @@ class CopyFilesApp:
         for padre in self.tree_dup.get_children():
             for hijo in self.tree_dup.get_children(padre):
                 valores = self.tree_dup.item(hijo, "values")
-                if not valores or valores[2] not in ("ELIMINAR", "DELETE"):
+                if not valores or len(valores) < 3:
+                    continue
+                if valores[2] not in ("ELIMINAR", "DELETE"):
                     continue
                 nombre = self.tree_dup.item(hijo, "text")
-                ruta_abs = str(Path(valores[0]) / nombre)
+                ruta_abs = str(Path(str(valores[0])) / nombre)
 
                 if es_dry:
                     tamano = Path(ruta_abs).stat().st_size if Path(ruta_abs).exists() else 0
@@ -915,6 +947,7 @@ class CopyFilesApp:
 
         messagebox.showinfo(titulo, cuerpo)
         self.btn_ejecutar_dup.configure(state="disabled")
+        self.btn_exportar_csv.configure(state="disabled")
         for row in self.tree_dup.get_children():
             self.tree_dup.delete(row)
         self.lbl_status_dup.configure(text=self.t("dup_init_status"))

@@ -36,12 +36,14 @@ class SyncEngine:
 
     def __init__(self, config: AppConfig, on_log: LogCallback,
                  on_progress: ProgressCallback, history: HistoryManager | None = None,
-                 checkpoint_path: Path = CHK_SINCRO):
+                 checkpoint_path: Path = CHK_SINCRO,
+                 on_finished: Callable[[], None] | None = None):
         self.cfg = config
         self.origen = Path(config.origen).resolve()
         self.destino = Path(config.destino).resolve()
         self.on_log = on_log
         self.on_progress = on_progress
+        self.on_finished = on_finished
         self.history = history or HistoryManager()
         self.checkpoint_path = checkpoint_path
 
@@ -121,7 +123,8 @@ class SyncEngine:
     # ------------------------------------------------------------------
     @staticmethod
     def resolver_nombre_dinamico(patron: str, archivo_path, secuencial: int,
-                                  regex_busca: str = "", regex_reemplaza: str = "") -> str:
+                                  regex_busca: str = "", regex_reemplaza: str = "",
+                                  origen_base: Path | None = None) -> str:
         archivo = Path(archivo_path)
         try:
             stat = archivo.stat() if archivo.exists() else None
@@ -137,6 +140,16 @@ class SyncEngine:
             except re.error as exc:
                 logger.debug("RegEx de renombrado inválida: %s", exc)
 
+        # {ruta_relativa}: sub-ruta desde el origen hasta la carpeta del archivo
+        # Ej: origen=C:\temp\folder1, archivo=C:\temp\folder1\folder2\img.jpg → "folder1/folder2"
+        ruta_relativa = ""
+        if origen_base is not None:
+            try:
+                rel = archivo.parent.relative_to(origen_base.parent)
+                ruta_relativa = str(rel).replace("\\", "/")
+            except ValueError:
+                ruta_relativa = archivo.parent.name
+
         tokens = {
             "{nombre_origen}": nombre_base, "{secuencial}": f"{secuencial:04d}",
             "{fecha_fichero}": f_mtime.strftime("%Y_%m_%d"), "{año}": f_mtime.strftime("%Y"),
@@ -147,6 +160,7 @@ class SyncEngine:
             "{file_date}": f_mtime.strftime("%Y_%m_%d"), "{year}": f_mtime.strftime("%Y"),
             "{month}": f_mtime.strftime("%m"), "{day}": f_mtime.strftime("%d"),
             "{current_date}": f_actual.strftime("%Y_%m_%d"), "{root_folder}": archivo.parent.name,
+            "{ruta_relativa}": ruta_relativa, "{relative_path}": ruta_relativa,
         }
 
         resultado = patron
@@ -166,7 +180,9 @@ class SyncEngine:
                 return 1
             patron_fichero = patron_base.split("/")[-1] if "/" in patron_base else patron_base
             test_nombre = self.resolver_nombre_dinamico(
-                patron_fichero, archivo_origen, 0, self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza
+                patron_fichero, archivo_origen, 0,
+                self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza,
+                origen_base=self.origen,
             )
             token_sec = "{sequential}" if "{sequential}" in patron_fichero else "{secuencial}"
             prefix_test = test_nombre.split(token_sec)[0] if token_sec in patron_fichero else test_nombre
@@ -212,6 +228,10 @@ class SyncEngine:
             self.on_log(f"Critical error: {exc}", "error")
         finally:
             self.activo = False
+            # Notifica a la GUI que el motor terminó (sea por fin natural o detención)
+            self.on_log("⏹️ Motor de sincronización finalizado.", "info")
+            if self.on_finished:
+                self.on_finished()
 
     def detener(self) -> None:
         self.activo = False
@@ -247,7 +267,9 @@ class SyncEngine:
             ext = archivo.suffix.lower()
             patron_global = self.cfg.patron_renombrado
             nombre_evaluado = self.resolver_nombre_dinamico(
-                patron_global, archivo, 1, self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza
+                patron_global, archivo, 1,
+                self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza,
+                origen_base=self.origen,
             )
 
             if "/" in nombre_evaluado:
@@ -265,6 +287,7 @@ class SyncEngine:
             nuevo_nombre_stem = self.resolver_nombre_dinamico(
                 patron_solo_archivo, archivo, num_secuencial,
                 self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza,
+                origen_base=self.origen,
             )
 
             ruta_destino = carpeta_destino / f"{nuevo_nombre_stem}{ext}"

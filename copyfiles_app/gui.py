@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from .constants import PALETAS_PREDEFINIDAS, DEFAULT_RENAME_TOKENS
-from .duplicate_engine import DuplicateEngine, DuplicateOptions
+from .duplicate_engine import DuplicateEngine, DuplicateOptions, _compute_phash
 from .localization import Translator
 from .models import AppConfig
 from .persistence import HashCache, HistoryManager
@@ -95,6 +95,8 @@ class CopyFilesApp:
         self.ren_regex_busca_var = tk.StringVar(value=c.ren_regex_busca)
         self.ren_regex_reemplaza_var = tk.StringVar(value=c.ren_regex_reemplaza)
         self.metodo_borrado_var = tk.StringVar(value=c.accion_duplicados)
+        self.modo_similitud_var = tk.StringVar(value=c.modo_similitud_dup)
+        self.umbral_similitud_var = tk.IntVar(value=c.umbral_similitud_dup)
 
         self.modo_apariencia_var = tk.StringVar(value=c.modo_apariencia)
         self.color_acento_var = tk.StringVar(value=c.color_acento_personalizado)
@@ -256,6 +258,33 @@ class CopyFilesApp:
                                                variable=self.chk_dup_nombre_var)
         self.chk_dup_nombre.pack(side="left", padx=10)
 
+        # Similitud de imágenes
+        ctk.CTkLabel(f_checks_dup, text="Modo imágenes:").pack(side="left", padx=(15, 2))
+        self.combo_similitud = ctk.CTkComboBox(
+            f_checks_dup,
+            values=["Coincidencia Exacta", "Imágenes Similares (phash)"],
+            width=210,
+            command=self._on_modo_similitud_change,
+        )
+        self.combo_similitud.pack(side="left", padx=2)
+        self.combo_similitud.set(
+            "Imágenes Similares (phash)"
+            if self.modo_similitud_var.get() == "similar"
+            else "Coincidencia Exacta"
+        )
+        ctk.CTkLabel(f_checks_dup, text="Umbral:").pack(side="left", padx=(8, 2))
+        self.slider_umbral = ctk.CTkSlider(
+            f_checks_dup, from_=1, to=30, number_of_steps=29,
+            variable=self.umbral_similitud_var, width=100,
+        )
+        self.slider_umbral.pack(side="left", padx=2)
+        self.lbl_umbral_val = ctk.CTkLabel(f_checks_dup, text="10", width=28)
+        self.lbl_umbral_val.pack(side="left")
+        self.umbral_similitud_var.trace_add(
+            "write",
+            lambda *_: self.lbl_umbral_val.configure(text=str(self.umbral_similitud_var.get()))
+        )
+
         ctk.CTkLabel(f_checks_dup, text="Hilos asignados:").pack(side="left", padx=15)
         self.combo_hilos = ctk.CTkComboBox(f_checks_dup, values=["1", "2", "4", "8", "16"], width=80)
         self.combo_hilos.pack(side="left", padx=5)
@@ -290,7 +319,7 @@ class CopyFilesApp:
         scr_d = ttk.Scrollbar(f_arbol, orient="vertical", command=self.tree_dup.yview)
         self.tree_dup.configure(yscrollcommand=scr_d.set)
         scr_d.pack(side="right", fill="y")
-        self.tree_dup.bind("<Double-1>", self._alternar_accion_item_dup)
+        self.tree_dup.bind("<Double-1>", self._dbl_click_dup_tree)
 
         f_status_dup = ctk.CTkFrame(self.tab_dup)
         f_status_dup.pack(fill="x", padx=15, pady=5)
@@ -305,6 +334,13 @@ class CopyFilesApp:
         f_footer_dup.pack(fill="x", padx=15, pady=10)
         self.lbl_metrics_dup = ctk.CTkLabel(f_footer_dup, text=self.t("metrics_init"), font=("Consolas", 11))
         self.lbl_metrics_dup.pack(side="left", padx=10)
+        self.lbl_stats_tipos = ctk.CTkLabel(f_footer_dup, text="", font=("Consolas", 10), text_color="#888888")
+        self.lbl_stats_tipos.pack(side="left", padx=10)
+        self.btn_exportar_csv = ctk.CTkButton(
+            f_footer_dup, text="📄 Exportar CSV", fg_color="#37474f", hover_color="#455a64",
+            state="disabled", command=self._exportar_csv_duplicados, width=140,
+        )
+        self.btn_exportar_csv.pack(side="right", padx=5)
         self.btn_ejecutar_dup = ctk.CTkButton(f_footer_dup, text=self.t("btn_ejecutar_acc"), fg_color="#b71c1c",
                                                hover_color="#c62828", state="disabled",
                                                command=self._ejecutar_limpieza_duplicados, width=220)
@@ -548,6 +584,8 @@ class CopyFilesApp:
             ren_regex_busca=self.ren_regex_busca_var.get(), ren_regex_reemplaza=self.ren_regex_reemplaza_var.get(),
             accion_duplicados=self.metodo_borrado_var.get(), filtro_tamano_min=self.txt_size_min.get(),
             filtro_tamano_max=self.txt_size_max.get(), modo_apariencia=self.modo_apariencia_var.get(),
+            modo_similitud_dup=self.modo_similitud_var.get(),
+            umbral_similitud_dup=self.umbral_similitud_var.get(),
             color_acento_personalizado=self.color_acento_var.get(), color_fondo_paneles=self.color_marcos_var.get(),
         )
 
@@ -654,11 +692,18 @@ class CopyFilesApp:
         except ValueError:
             hilos = 4
 
+        modo_sim = (
+            "similar"
+            if "Similar" in self.combo_similitud.get()
+            else "exact"
+        )
         opts = DuplicateOptions(
             incluir_fotos=self.chk_fotos_var.get(), incluir_videos=self.chk_videos_var.get(),
             incluir_docs=self.chk_docs_var.get(), incluir_otros=self.chk_otros_var.get(),
             filtrar_por_nombre=self.chk_dup_nombre_var.get(), filtrar_por_tamano=self.chk_dup_tamano_var.get(),
             max_hilos=hilos,
+            modo_similitud=modo_sim,
+            umbral_similitud=self.umbral_similitud_var.get(),
         )
 
         def ejecucion_fondo():
@@ -672,6 +717,12 @@ class CopyFilesApp:
                     "metrics_text", ficheros=metricas["ficheros"],
                     directorios=metricas["directorios"], tiempo=metricas["tiempo_ms"],
                 ))
+                # Estadísticas por tipo de archivo (Mejora #2)
+                stats = metricas.get("stats", {})
+                if stats:
+                    top = sorted(stats.items(), key=lambda x: -x[1])[:4]
+                    stats_txt = "  |  ".join(f"{ext}: {n}" for ext, n in top)
+                    self.lbl_stats_tipos.configure(text=f"Por tipo: {stats_txt}")
                 self._finalizar_analisis_ui()
             self.root.after(0, _finalizar)
 
@@ -681,6 +732,7 @@ class CopyFilesApp:
         self.duplicados_en_progreso = False
         self.btn_analizar_dup.configure(text=self.t("btn_analizar_dup"), fg_color="#0052cc")
         self.btn_ejecutar_dup.configure(state="disabled")
+        self.btn_exportar_csv.configure(state="disabled")
 
         for row in self.tree_dup.get_children():
             self.tree_dup.delete(row)
@@ -693,8 +745,17 @@ class CopyFilesApp:
         self.lbl_status_dup.configure(
             text=self.t("dup_status_found", num_grupos=len(self.duplicados_detectados)), text_color="#b71c1c")
 
-        for idx_grupo, (_, nodos) in enumerate(self.duplicados_detectados.items(), start=1):
-            id_padre = self.tree_dup.insert("", "end", text=f"📦 {self.t('dup_grupo_prefijo')} {idx_grupo}", open=True)
+        for idx_grupo, (llave_grupo, nodos) in enumerate(self.duplicados_detectados.items(), start=1):
+            es_similar = llave_grupo.startswith("SIMILAR_")
+            icono = "🖼️" if es_similar else "📦"
+            etiqueta_tipo = " [SIMILAR]" if es_similar else ""
+            id_padre = self.tree_dup.insert(
+                "", "end",
+                text=f"{icono} {self.t('dup_grupo_prefijo')} {idx_grupo}{etiqueta_tipo}",
+                open=True,
+            )
+            if es_similar:
+                self.tree_dup.item(id_padre, tags=("tag_similar_group",))
             self.tree_dup.set(id_padre, "Ruta", "")
             self.tree_dup.set(id_padre, "Tamaño", "")
             self.tree_dup.set(id_padre, "Acción", "Grupo")
@@ -712,8 +773,69 @@ class CopyFilesApp:
 
         self.tree_dup.tag_configure("tag_mantener", background="#e8f5e9", foreground="#2e7d32")
         self.tree_dup.tag_configure("tag_eliminar", background="#ffebee", foreground="#c62828")
+        # Mark SIMILAR groups distinctly
+        self.tree_dup.tag_configure("tag_similar_group", foreground="#ff8f00", font=("Segoe UI", 10, "italic"))
         self.btn_ejecutar_dup.configure(state="normal")
+        self.btn_exportar_csv.configure(state="normal")
         self._recalcular_ahorro_espacio()
+
+    def _on_modo_similitud_change(self, val: str) -> None:
+        """Habilita/deshabilita slider según modo seleccionado."""
+        is_sim = "Similar" in val
+        state = "normal" if is_sim else "disabled"
+        self.slider_umbral.configure(state=state)
+        self.modo_similitud_var.set("similar" if is_sim else "exact")
+        self._guardar_config_live()
+
+    def _exportar_csv_duplicados(self) -> None:
+        """Mejora #3: exportar informe a CSV."""
+        from tkinter import filedialog as fd
+        ruta = fd.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+            title="Guardar informe de duplicados",
+        )
+        if not ruta:
+            return
+        ok = self.dup_engine.exportar_csv(self.duplicados_detectados, ruta)
+        if ok:
+            from tkinter import messagebox as mb
+            mb.showinfo("Exportación completada", f"Informe guardado en:\n{ruta}")
+        else:
+            from tkinter import messagebox as mb
+            mb.showerror("Error", "No se pudo exportar el CSV. Revisa el log.")
+
+    def _abrir_preview_imagen(self, ruta_abs: str) -> None:
+        """Mejora #1: preview de imagen duplicada en ventana flotante."""
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            from tkinter import messagebox as mb
+            mb.showwarning("Pillow no instalado", "Instala Pillow para previsualizar imágenes:\npip install Pillow")
+            return
+
+        p = Path(ruta_abs)
+        if not p.exists() or p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".tiff"}:
+            return
+
+        win = ctk.CTkToplevel(self.root)
+        win.title(f"Preview: {p.name}")
+        win.geometry("600x480")
+        win.grab_set()
+
+        try:
+            img = Image.open(ruta_abs)
+            img.thumbnail((560, 380))
+            photo = ImageTk.PhotoImage(img)
+            lbl_img = tk.Label(win, image=photo, bg="#1a1a1a")
+            lbl_img.image = photo  # keep reference
+            lbl_img.pack(padx=10, pady=10)
+        except Exception as exc:
+            ctk.CTkLabel(win, text=f"No se pudo cargar la imagen:\n{exc}").pack(padx=20, pady=20)
+
+        info = f"{p.name}\nTamaño: {p.stat().st_size / (1024*1024):.2f} MB\nRuta: {p.parent}"
+        ctk.CTkLabel(win, text=info, font=("Consolas", 10), justify="left").pack(padx=10, pady=5)
+        ctk.CTkButton(win, text="Cerrar", command=win.destroy, width=100).pack(pady=8)
 
     def _recalcular_ahorro_espacio(self) -> None:
         total_bytes = 0
@@ -728,6 +850,24 @@ class CopyFilesApp:
         mb = total_bytes / (1024 * 1024)
         clave = "disk_saving_dry" if self.dry_run_var.get() else "disk_saving_real"
         self.lbl_saving_dup.configure(text=self.t(clave, megas=mb))
+
+    def _dbl_click_dup_tree(self, event) -> None:
+        """Mejora #1: doble-clic en hijo abre preview si es imagen, en padre alterna."""
+        item_id = self.tree_dup.identify_row(event.y)
+        if not item_id:
+            return
+        # ¿Es hijo (tiene padre)?
+        parent = self.tree_dup.parent(item_id)
+        if parent:
+            valores = self.tree_dup.item(item_id, "values")
+            if valores:
+                nombre = self.tree_dup.item(item_id, "text")
+                ruta_abs = str(Path(valores[0]) / nombre)
+                ext = Path(ruta_abs).suffix.lower()
+                if ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}:
+                    self._abrir_preview_imagen(ruta_abs)
+                    return
+        self._alternar_accion_item_dup(event)
 
     def _alternar_accion_item_dup(self, event) -> None:
         item_id = self.tree_dup.identify_row(event.y)

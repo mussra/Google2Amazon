@@ -36,7 +36,7 @@ class SyncEngine:
 
     def __init__(self, config: AppConfig, on_log: LogCallback,
                  on_progress: ProgressCallback, history: HistoryManager | None = None,
-                 checkpoint_path: Path = CHK_SINCRO,
+                 checkpoint_path: Path | None = None,
                  on_finished: Callable[[], None] | None = None):
         self.cfg = config
         self.origen = Path(config.origen).resolve()
@@ -45,6 +45,13 @@ class SyncEngine:
         self.on_progress = on_progress
         self.on_finished = on_finished
         self.history = history or HistoryManager()
+
+        # Cada instancia usa su propio archivo de checkpoint derivado del destino,
+        # así los motores paralelos nunca comparten ni pisan el mismo fichero.
+        if checkpoint_path is None:
+            import hashlib as _hl
+            slug = _hl.md5(str(self.destino).encode()).hexdigest()[:10]
+            checkpoint_path = CHK_SINCRO.parent / f"CopyFiles_checkpoint_sincro_{slug}.json"
         self.checkpoint_path = checkpoint_path
 
         self.activo = False
@@ -204,9 +211,21 @@ class SyncEngine:
         if self.cfg.dry_run:
             return
         if self.cfg.copia_atomica:
-            destino_tmp = destino_path.with_suffix(destino_path.suffix + ".tmp")
-            shutil.copy2(origen_path, destino_tmp)
-            os.replace(destino_tmp, destino_path)
+            # El .tmp debe estar en la MISMA carpeta que el destino final para que
+            # os.replace funcione en todos los sistemas, incluidas copias cross-device
+            # (p.ej. C: → D:). Si origen y destino están en unidades distintas,
+            # os.replace lanzaría WinError 433 con un .tmp creado fuera del destino.
+            destino_tmp = destino_path.parent / (destino_path.name + ".tmp")
+            try:
+                shutil.copy2(origen_path, destino_tmp)
+                os.replace(destino_tmp, destino_path)
+            except Exception:
+                # Limpiar el temporal huérfano si algo falla
+                try:
+                    destino_tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
         else:
             shutil.copy2(origen_path, destino_path)
 

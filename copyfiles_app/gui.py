@@ -45,7 +45,7 @@ class CopyFilesApp:
 
         self._aplicar_paleta(self.config.modo_apariencia)
 
-        self.sync_engine: SyncEngine | None = None
+        self._sync_engines: list[SyncEngine] = []
         self.dup_engine = DuplicateEngine(hash_cache=self.hash_cache)
         self.duplicados_detectados: dict[str, list] = {}
         self.contador_archivos = 0
@@ -59,7 +59,7 @@ class CopyFilesApp:
         self._construir_interfaz()
 
         self.txt_origen.insert(0, self.config.origen)
-        self.txt_destino.insert(0, self.config.destino)
+        self._restaurar_destinos()
 
         self._actualizar_idioma_ui()
         self._precargar_checkpoint_sincro()
@@ -177,13 +177,26 @@ class CopyFilesApp:
                                               command=self._examinar_origen, width=100)
         self.btn_buscar_orig.grid(row=0, column=2, padx=10, pady=5)
 
-        self.lbl_destino = ctk.CTkLabel(frame_rutas, text=self.t("lbl_destino"))
-        self.lbl_destino.grid(row=1, column=0, padx=10, pady=5, sticky="w")
-        self.txt_destino = ctk.CTkEntry(frame_rutas, width=500)
-        self.txt_destino.grid(row=1, column=1, padx=10, pady=5)
-        self.btn_buscar_dest = ctk.CTkButton(frame_rutas, text=self.t("btn_buscar"),
-                                              command=self._examinar_destino, width=100)
-        self.btn_buscar_dest.grid(row=1, column=2, padx=10, pady=5)
+        # ── Destinos múltiples ────────────────────────────────────────────
+        lbl_dest = ctk.CTkLabel(frame_rutas, text=self.t("lbl_destino"))
+        lbl_dest.grid(row=1, column=0, padx=10, pady=(5, 2), sticky="nw")
+
+        f_dest_list = ctk.CTkFrame(frame_rutas, fg_color="transparent")
+        f_dest_list.grid(row=1, column=1, padx=10, pady=(5, 2), sticky="ew")
+        frame_rutas.columnconfigure(1, weight=1)
+
+        self.lista_destinos = ttk.Treeview(f_dest_list, columns=("Ruta",), show="headings", height=3)
+        self.lista_destinos.heading("Ruta", text="Carpetas destino (copias paralelas)")
+        self.lista_destinos.column("Ruta", anchor="w")
+        self.lista_destinos.pack(fill="x", expand=True)
+
+        f_dest_btns = ctk.CTkFrame(frame_rutas, fg_color="transparent")
+        f_dest_btns.grid(row=1, column=2, padx=10, pady=(5, 2), sticky="n")
+        ctk.CTkButton(f_dest_btns, text="➕ Añadir", width=100,
+                      command=self._agregar_destino).pack(pady=2)
+        ctk.CTkButton(f_dest_btns, text="➖ Quitar", width=100,
+                      fg_color="#b71c1c", hover_color="#c62828",
+                      command=self._quitar_destino).pack(pady=2)
 
         frame_tipos = ctk.CTkFrame(self.tab_sincro)
         frame_tipos.pack(fill="x", padx=15, pady=5)
@@ -249,19 +262,20 @@ class CopyFilesApp:
                                            command=self._quitar_ruta_dup)
         self.btn_del_ruta.pack(pady=2)
 
-        f_checks_dup = ctk.CTkFrame(frame_top, fg_color="transparent")
-        f_checks_dup.pack(fill="x", padx=5, pady=5)
-        self.chk_dup_tamano = ctk.CTkCheckBox(f_checks_dup, text=self.t("chk_dup_tamano"),
-                                               variable=self.chk_dup_tamano_var)
-        self.chk_dup_tamano.pack(side="left", padx=10)
-        self.chk_dup_nombre = ctk.CTkCheckBox(f_checks_dup, text=self.t("chk_dup_nombre"),
-                                               variable=self.chk_dup_nombre_var)
-        self.chk_dup_nombre.pack(side="left", padx=10)
+        # ── Fila 1: filtros de contenido + similitud ──────────────────────
+        f_fila1 = ctk.CTkFrame(frame_top, fg_color="transparent")
+        f_fila1.pack(fill="x", padx=5, pady=(5, 2))
 
-        # Similitud de imágenes
-        ctk.CTkLabel(f_checks_dup, text="Modo imágenes:").pack(side="left", padx=(15, 2))
+        self.chk_dup_tamano = ctk.CTkCheckBox(f_fila1, text=self.t("chk_dup_tamano"),
+                                               variable=self.chk_dup_tamano_var)
+        self.chk_dup_tamano.pack(side="left", padx=(10, 6))
+        self.chk_dup_nombre = ctk.CTkCheckBox(f_fila1, text=self.t("chk_dup_nombre"),
+                                               variable=self.chk_dup_nombre_var)
+        self.chk_dup_nombre.pack(side="left", padx=6)
+
+        ctk.CTkLabel(f_fila1, text="Modo imágenes:").pack(side="left", padx=(14, 2))
         self.combo_similitud = ctk.CTkComboBox(
-            f_checks_dup,
+            f_fila1,
             values=["Coincidencia Exacta", "Imágenes Similares (phash)"],
             width=210,
             command=self._on_modo_similitud_change,
@@ -272,28 +286,34 @@ class CopyFilesApp:
             if self.modo_similitud_var.get() == "similar"
             else "Coincidencia Exacta"
         )
-        ctk.CTkLabel(f_checks_dup, text="Umbral:").pack(side="left", padx=(8, 2))
+        ctk.CTkLabel(f_fila1, text="Umbral:").pack(side="left", padx=(8, 2))
         self.slider_umbral = ctk.CTkSlider(
-            f_checks_dup, from_=1, to=30, number_of_steps=29,
-            variable=self.umbral_similitud_var, width=100,
+            f_fila1, from_=1, to=30, number_of_steps=29,
+            variable=self.umbral_similitud_var, width=90,
         )
         self.slider_umbral.pack(side="left", padx=2)
-        self.lbl_umbral_val = ctk.CTkLabel(f_checks_dup, text="10", width=28)
+        self.lbl_umbral_val = ctk.CTkLabel(f_fila1, text="10", width=26)
         self.lbl_umbral_val.pack(side="left")
         self.umbral_similitud_var.trace_add(
             "write",
             lambda *_: self.lbl_umbral_val.configure(text=str(self.umbral_similitud_var.get()))
         )
 
-        ctk.CTkLabel(f_checks_dup, text="Hilos asignados:").pack(side="left", padx=15)
-        self.combo_hilos = ctk.CTkComboBox(f_checks_dup, values=["1", "2", "4", "8", "16"], width=80)
-        self.combo_hilos.pack(side="left", padx=5)
+        # ── Fila 2: hilos + botón analizar (siempre visible) ─────────────
+        f_fila2 = ctk.CTkFrame(frame_top, fg_color="transparent")
+        f_fila2.pack(fill="x", padx=5, pady=(2, 6))
+
+        ctk.CTkLabel(f_fila2, text="Hilos asignados:").pack(side="left", padx=(10, 4))
+        self.combo_hilos = ctk.CTkComboBox(f_fila2, values=["1", "2", "4", "8", "16"], width=72)
+        self.combo_hilos.pack(side="left", padx=(0, 10))
         self.combo_hilos.set("4")
 
-        self.btn_analizar_dup = ctk.CTkButton(f_checks_dup, text=self.t("btn_analizar_dup"), fg_color="#0052cc",
-                                               hover_color="#0043a4", command=self._click_analizar_duplicados,
-                                               width=180)
-        self.btn_analizar_dup.pack(side="right", padx=10)
+        self.btn_analizar_dup = ctk.CTkButton(
+            f_fila2, text=self.t("btn_analizar_dup"),
+            fg_color="#0052cc", hover_color="#0043a4",
+            command=self._click_analizar_duplicados, width=200,
+        )
+        self.btn_analizar_dup.pack(side="left", padx=4)
 
         f_perf = ctk.CTkFrame(self.tab_dup)
         f_perf.pack(fill="x", padx=15, pady=5)
@@ -485,13 +505,6 @@ class CopyFilesApp:
             self.txt_origen.insert(0, dir_s)
             self._guardar_config_live()
 
-    def _examinar_destino(self) -> None:
-        dir_s = filedialog.askdirectory()
-        if dir_s:
-            self.txt_destino.delete(0, "end")
-            self.txt_destino.insert(0, dir_s)
-            self._guardar_config_live()
-
     def _agregar_ruta_dup(self) -> None:
         dir_s = filedialog.askdirectory()
         if not dir_s:
@@ -538,7 +551,7 @@ class CopyFilesApp:
 
         widget_keys = {
             "lbl_origen": "lbl_origen", "lbl_destino": "lbl_destino",
-            "btn_buscar_orig": "btn_buscar", "btn_buscar_dest": "btn_buscar",
+            "btn_buscar_orig": "btn_buscar",
             "chk_fotos": "chk_fotos", "chk_videos": "chk_videos", "chk_docs": "chk_docs", "chk_otros": "chk_otros",
             "rad_copiar": "rad_copiar", "rad_mover": "rad_mover",
             "chk_dry": "chk_dry", "chk_atomic": "chk_atomic", "lbl_ex_rx": "lbl_ex_rx",
@@ -562,7 +575,7 @@ class CopyFilesApp:
         self.tree_dup.heading("Tamaño", text=t("tree_hdr_tamano"))
         self.tree_dup.heading("Acción", text=t("tree_hdr_accion"))
 
-        en_marcha = bool(self.sync_engine and self.sync_engine.activo)
+        en_marcha = bool(self._sync_engines)
         self.btn_lanzar.configure(text=t("btn_detener") if en_marcha else t("btn_lanzar"))
         self.lbl_estado.configure(text=t("lbl_estado_on") if en_marcha else t("lbl_estado_off"))
         self._evaluar_preview_wizard()
@@ -581,8 +594,11 @@ class CopyFilesApp:
     # Configuración
     # ------------------------------------------------------------------
     def _recopilar_config(self) -> AppConfig:
+        import json as _json
+        destinos = self._get_destinos()
         return AppConfig(
-            idioma=self.t.lang, origen=self.txt_origen.get().strip(), destino=self.txt_destino.get().strip(),
+            idioma=self.t.lang, origen=self.txt_origen.get().strip(),
+            destino=_json.dumps(destinos, ensure_ascii=False),
             chk_fotos=self.chk_fotos_var.get(), chk_videos=self.chk_videos_var.get(),
             chk_docs=self.chk_docs_var.get(), chk_otros=self.chk_otros_var.get(),
             modo_mover=self.radio_accion_var.get() == "mover", dry_run=self.dry_run_var.get(),
@@ -621,43 +637,120 @@ class CopyFilesApp:
             self.lbl_estado.configure(text=f"Procesados: {self.contador_archivos} ({mb:.2f} MB)")
         self.root.after(0, _do)
 
+    # ------------------------------------------------------------------
+    # Gestión de destinos múltiples
+    # ------------------------------------------------------------------
+    def _agregar_destino(self) -> None:
+        ruta = filedialog.askdirectory(title="Seleccionar carpeta destino")
+        if not ruta:
+            return
+        rutas_existentes = [
+            self.lista_destinos.item(i, "values")[0]
+            for i in self.lista_destinos.get_children()
+        ]
+        if ruta not in rutas_existentes:
+            self.lista_destinos.insert("", "end", values=(ruta,))
+        self._guardar_config_live()
+
+    def _quitar_destino(self) -> None:
+        sel = self.lista_destinos.selection()
+        for item in sel:
+            self.lista_destinos.delete(item)
+        self._guardar_config_live()
+
+    def _get_destinos(self) -> list[str]:
+        return [
+            self.lista_destinos.item(i, "values")[0]
+            for i in self.lista_destinos.get_children()
+        ]
+
     def _alternar_sincronizacion(self) -> None:
-        if self.sync_engine and self.sync_engine.activo:
-            self.sync_engine.detener()
+        # ── DETENER ──────────────────────────────────────────────────────
+        if self._sync_engines:
+            for eng in self._sync_engines:
+                eng.detener()
+            self._sync_engines.clear()
             self.btn_lanzar.configure(text=self.t("btn_lanzar"), fg_color="#1b5e20", hover_color="#2e7d32")
             self.lbl_estado.configure(text=self.t("lbl_estado_off"))
             self._agregar_log("⏹️ Servicio detenido por el usuario.")
             return
 
+        # ── VALIDAR ───────────────────────────────────────────────────────
         self._guardar_config_live()
         cfg = self.config
-        if not cfg.origen or not cfg.destino:
-            messagebox.showwarning("Configuración", "Defina origen y destino válidos.")
+        destinos = self._get_destinos()
+
+        if not cfg.origen:
+            messagebox.showwarning("Configuración", "Defina la carpeta origen.")
+            return
+        if not destinos:
+            messagebox.showwarning("Configuración", "Añade al menos una carpeta destino.")
             return
         if not Path(cfg.origen).exists():
             messagebox.showerror("Configuración", "La carpeta origen no existe.")
             return
 
+        # ── LANZAR N motores en paralelo, uno por destino ────────────────
         self.contador_archivos = 0
         self.bytes_processed = 0
         self.progress_bar.set(0)
-        def _on_sync_finished():
-            def _ui():
-                self.btn_lanzar.configure(
-                    text=self.t("btn_lanzar"), fg_color="#1b5e20", hover_color="#2e7d32")
-                self.lbl_estado.configure(text=self.t("lbl_estado_off"))
-                self.progress_bar.set(1.0)
-            self.root.after(0, _ui)
+        self._sync_engines: list[SyncEngine] = []
 
-        self.sync_engine = SyncEngine(
-            cfg, self._agregar_log, self._actualizar_progreso,
-            history=self.history, on_finished=_on_sync_finished,
-        )
-        self.sync_engine.activo = True
+        import dataclasses
+        pendientes = [True] * len(destinos)   # un slot por motor
+
+        def _make_finished_cb(idx: int):
+            def _on_finished():
+                pendientes[idx] = False
+                self._agregar_log(f"✅ Destino [{idx+1}] finalizado: {destinos[idx]}")
+                if not any(pendientes):           # todos terminaron
+                    def _ui():
+                        self._sync_engines.clear()
+                        self.btn_lanzar.configure(
+                            text=self.t("btn_lanzar"), fg_color="#1b5e20", hover_color="#2e7d32")
+                        self.lbl_estado.configure(text=self.t("lbl_estado_off"))
+                        self.progress_bar.set(1.0)
+                    self.root.after(0, _ui)
+            return _on_finished
+
+        for idx, dest in enumerate(destinos):
+            cfg_dest = dataclasses.replace(cfg, destino=dest)
+            engine = SyncEngine(
+                cfg_dest,
+                self._agregar_log,
+                self._actualizar_progreso,
+                history=self.history,
+                on_finished=_make_finished_cb(idx),
+            )
+            engine.activo = True
+            self._sync_engines.append(engine)
+            self._agregar_log(f"🚀 Motor [{idx+1}/{len(destinos)}] → {dest}")
+            threading.Thread(target=engine.iniciar, daemon=True).start()
+
+        n = len(destinos)
         self.btn_lanzar.configure(text=self.t("btn_detener"), fg_color="#b71c1c", hover_color="#c62828")
-        self.lbl_estado.configure(text=self.t("lbl_estado_on"))
-        self._agregar_log("🚀 Motor de sincronización iniciado...")
-        threading.Thread(target=self.sync_engine.iniciar, daemon=True).start()
+        self.lbl_estado.configure(
+            text=f"{self.t('lbl_estado_on')} ({n} destino{'s' if n > 1 else ''})"
+        )
+
+    def _restaurar_destinos(self) -> None:
+        """Carga la lista de destinos guardada (JSON) en config.destino."""
+        import json as _json
+        raw = self.config.destino
+        if not raw:
+            return
+        try:
+            destinos = _json.loads(raw)
+            if isinstance(destinos, list):
+                for d in destinos:
+                    if d:
+                        self.lista_destinos.insert("", "end", values=(d,))
+                return
+        except (_json.JSONDecodeError, TypeError):
+            pass
+        # Compatibilidad con versiones anteriores: valor es ruta plana
+        if raw.strip():
+            self.lista_destinos.insert("", "end", values=(raw.strip(),))
 
     def _precargar_checkpoint_sincro(self) -> None:
         from .constants import CHK_SINCRO
@@ -1034,8 +1127,8 @@ class CopyFilesApp:
     # ------------------------------------------------------------------
     def _al_cerrar(self) -> None:
         try:
-            if self.sync_engine:
-                self.sync_engine.detener()
+            for eng in self._sync_engines:
+                eng.detener()
             self.dup_engine.cancelar()
             self._guardar_config_live()
             self.hash_cache.close()

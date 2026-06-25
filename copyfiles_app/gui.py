@@ -29,6 +29,7 @@ from .persistence import HashCache, HistoryManager
 from .sessions import SessionManager, Session, DiskRef, get_volume_id
 from .mirror_engine import MirrorEngine, MirrorOptions, MirrorDiff
 from .regex_wizard import RegexWizard
+from .report import generar_html, generar_csv, abrir_archivo, programar_apagado, cancelar_apagado
 from .sync_engine import SyncEngine
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class CopyFilesApp:
         self._aplicar_paleta(self.config.modo_apariencia)
 
         self._sync_engines: list[SyncEngine] = []
+        self._all_engines: list[SyncEngine] = []
         self.dup_engine = DuplicateEngine(hash_cache=self.hash_cache)
         self.duplicados_detectados: dict[str, list] = {}
         self.contador_archivos = 0
@@ -244,6 +246,18 @@ class CopyFilesApp:
         self.btn_lanzar.pack(side="left", padx=15, pady=10)
         self.lbl_estado = ctk.CTkLabel(frame_controles, text=self.t("lbl_estado_off"), font=("Segoe UI", 12, "bold"))
         self.lbl_estado.pack(side="left", padx=20)
+
+        # ── Apagado automático ────────────────────────────────────────
+        self.apagado_var = tk.BooleanVar(value=False)
+        self.apagado_delay_var = tk.IntVar(value=60)
+        ctk.CTkCheckBox(frame_controles, text="⏻ Apagar al finalizar",
+                        variable=self.apagado_var).pack(side="right", padx=8)
+        ctk.CTkLabel(frame_controles, text="Espera (s):").pack(side="right", padx=(8, 0))
+        ctk.CTkEntry(frame_controles, textvariable=self.apagado_delay_var,
+                     width=55).pack(side="right", padx=2)
+        ctk.CTkButton(frame_controles, text="📋 Informe", width=100,
+                      fg_color="#37474f", hover_color="#455a64",
+                      command=self._generar_informe_ui).pack(side="right", padx=8)
 
         # ── Panel de sesiones ─────────────────────────────────────────────
         f_ses = ctk.CTkFrame(self.tab_sincro)
@@ -900,7 +914,8 @@ class CopyFilesApp:
         ).start()
 
         import dataclasses
-        pendientes = [True] * len(destinos)   # un slot por motor
+        pendientes = [True] * len(destinos)
+        self._all_engines: list[SyncEngine] = []   # para recoger reportes al final
 
         def _make_finished_cb(idx: int):
             def _on_finished():
@@ -913,6 +928,12 @@ class CopyFilesApp:
                             text=self.t("btn_lanzar"), fg_color="#1b5e20", hover_color="#2e7d32")
                         self.lbl_estado.configure(text=self.t("lbl_estado_off"))
                         self.progress_bar.set(1.0)
+                        if self.apagado_var.get():
+                            delay = max(10, self.apagado_delay_var.get())
+                            self._agregar_log(
+                                f"⏻ Apagado programado en {delay}s. "
+                                "Pulsa 'Cancelar apagado' si necesitas abortar.", "info")
+                            programar_apagado(delay)
                     self.root.after(0, _ui)
             return _on_finished
 
@@ -927,6 +948,7 @@ class CopyFilesApp:
             )
             engine.activo = True
             self._sync_engines.append(engine)
+            self._all_engines.append(engine)
             self._agregar_log(f"🚀 Motor [{idx+1}/{len(destinos)}] → {dest}")
             threading.Thread(target=engine.iniciar, daemon=True).start()
 
@@ -1052,6 +1074,40 @@ class CopyFilesApp:
         self._refrescar_combo_sesiones()
         self.combo_sesiones.set("— Nueva sesión —")
         self.lbl_ses_vol.configure(text="")
+
+    def _generar_informe_ui(self) -> None:
+        """Genera informe HTML+CSV con todas las operaciones de la sesión."""
+        todas_las_entradas = []
+        for eng in self._all_engines:
+            todas_las_entradas.extend(eng.get_report())
+
+        if not todas_las_entradas:
+            messagebox.showinfo("Informe", "No hay operaciones registradas en esta sesión.")
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        carpeta = Path.home() / "CopyFiles_Informes"
+        carpeta.mkdir(exist_ok=True)
+        ruta_html = carpeta / f"informe_{ts}.html"
+        ruta_csv  = carpeta / f"informe_{ts}.csv"
+
+        cfg = self.config
+        import json as _json
+        try:
+            destinos = _json.loads(cfg.destino)
+        except Exception:
+            destinos = [cfg.destino]
+
+        generar_html(todas_las_entradas, cfg.origen, destinos, ruta_html)
+        generar_csv(todas_las_entradas, ruta_csv)
+
+        n = len(todas_las_entradas)
+        ok = sum(1 for e in todas_las_entradas if e.ok)
+        mb = sum(e.bytes_size for e in todas_las_entradas if e.ok) / (1024 * 1024)
+        msg = (f"Informe generado: {n} operaciones ({ok} OK, {n-ok} errores, {mb:.1f} MB)\n\n"
+               f"HTML: {ruta_html}\nCSV:  {ruta_csv}\n\n¿Abrir el informe ahora?")
+        if messagebox.askyesno("Informe generado", msg):
+            abrir_archivo(ruta_html)
 
     def _restaurar_destinos(self) -> None:
         """Carga la lista de destinos guardada (JSON) en config.destino."""
@@ -1757,7 +1813,7 @@ class CopyFilesApp:
         self.lbl_espejo_status.configure(text="⏳ Analizando…")
         self.mirror_engine._cancelado.clear()
 
-        opts = MirrorOptions(
+        self._mir_opts = opts = MirrorOptions(
             incluir_fotos=self.mir_fotos_var.get(),
             incluir_videos=self.mir_videos_var.get(),
             incluir_docs=self.mir_docs_var.get(),
@@ -1811,7 +1867,7 @@ class CopyFilesApp:
             self.root.after(0, _ui)
 
         def _fondo():
-            ok, errores = self.mirror_engine.sincronizar(diffs, self._log_espejo, _progreso)
+            ok, errores = self.mirror_engine.sincronizar(diffs, self._mir_opts, self._log_espejo, _progreso)
             def _ui():
                 self.progress_espejo.set(1.0)
                 self.lbl_espejo_status.configure(

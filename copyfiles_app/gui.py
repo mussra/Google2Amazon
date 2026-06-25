@@ -10,6 +10,7 @@ o sustituir la interfaz en el futuro.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import webbrowser
 from datetime import datetime
@@ -25,6 +26,7 @@ from .duplicate_engine import DuplicateEngine, DuplicateOptions, _compute_phash
 from .localization import Translator
 from .models import AppConfig
 from .persistence import HashCache, HistoryManager
+from .sessions import SessionManager, Session, DiskRef, get_volume_id
 from .sync_engine import SyncEngine
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,11 @@ class CopyFilesApp:
         self.bytes_processed = 0
         self.duplicados_en_progreso = False
         self.progreso_hilos: dict[str, str] = {}
+        self.session_manager = SessionManager()
+        # Progreso real: total de bytes a copiar (calculado en hilo de fondo)
+        self._progress_total_bytes: int = 0
+        self._progress_done_bytes: int = 0
+        self._progress_lock = threading.Lock()
 
         self.t = Translator(self.config.idioma)
 
@@ -232,6 +239,26 @@ class CopyFilesApp:
         self.lbl_estado = ctk.CTkLabel(frame_controles, text=self.t("lbl_estado_off"), font=("Segoe UI", 12, "bold"))
         self.lbl_estado.pack(side="left", padx=20)
 
+        # ── Panel de sesiones ─────────────────────────────────────────────
+        f_ses = ctk.CTkFrame(self.tab_sincro)
+        f_ses.pack(fill="x", padx=15, pady=(0, 6))
+
+        ctk.CTkLabel(f_ses, text="💾 Sesiones guardadas:", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(10, 4))
+        self.combo_sesiones = ctk.CTkComboBox(f_ses, values=["— Nueva sesión —"], width=260,
+                                               command=self._on_sesion_seleccionada)
+        self.combo_sesiones.pack(side="left", padx=4)
+        self.combo_sesiones.set("— Nueva sesión —")
+        ctk.CTkButton(f_ses, text="💾 Guardar", width=90,
+                      command=self._guardar_sesion_ui).pack(side="left", padx=4)
+        ctk.CTkButton(f_ses, text="📂 Cargar", width=90,
+                      command=self._cargar_sesion_ui).pack(side="left", padx=4)
+        ctk.CTkButton(f_ses, text="🗑️ Borrar", width=90,
+                      fg_color="#b71c1c", hover_color="#7f0000",
+                      command=self._borrar_sesion_ui).pack(side="left", padx=4)
+        self.lbl_ses_vol = ctk.CTkLabel(f_ses, text="", font=("Consolas", 9), text_color="#888888")
+        self.lbl_ses_vol.pack(side="left", padx=10)
+        self._refrescar_combo_sesiones()
+
         self.progress_bar = ctk.CTkProgressBar(self.tab_sincro)
         self.progress_bar.pack(fill="x", padx=15, pady=5)
         self.progress_bar.set(0)
@@ -339,7 +366,9 @@ class CopyFilesApp:
         scr_d = ttk.Scrollbar(f_arbol, orient="vertical", command=self.tree_dup.yview)
         self.tree_dup.configure(yscrollcommand=scr_d.set)
         scr_d.pack(side="right", fill="y")
+        self.tree_dup.bind("<Button-1>", self._single_click_dup_tree)
         self.tree_dup.bind("<Double-1>", self._dbl_click_dup_tree)
+        self.tree_dup.bind("<Button-3>", self._ctx_menu_dup_tree)
 
         f_status_dup = ctk.CTkFrame(self.tab_dup)
         f_status_dup.pack(fill="x", padx=15, pady=5)
@@ -629,13 +658,61 @@ class CopyFilesApp:
         self.root.after(0, _do)
 
     def _actualizar_progreso(self, chunk_bytes: int) -> None:
-        def _do():
-            self.bytes_processed += chunk_bytes
+        with self._progress_lock:
+            self._progress_done_bytes += chunk_bytes
+            done = self._progress_done_bytes
+            total = self._progress_total_bytes
             self.contador_archivos += 1
-            mb = self.bytes_processed / (1024 * 1024)
-            self.progress_bar.set(min(1.0, self.contador_archivos / 100.0))
-            self.lbl_estado.configure(text=f"Procesados: {self.contador_archivos} ({mb:.2f} MB)")
+            n = self.contador_archivos
+
+        def _do():
+            mb_done = done / (1024 * 1024)
+            if total > 0:
+                ratio = min(1.0, done / total)
+                mb_total = total / (1024 * 1024)
+                self.progress_bar.set(ratio)
+                self.lbl_estado.configure(
+                    text=f"Procesados: {n} ({mb_done:.1f} / {mb_total:.1f} MB  {ratio*100:.0f}%)"
+                )
+            else:
+                # Total aún no calculado: barra indeterminada (oscila entre 0 y 0.95)
+                self.progress_bar.set(min(0.95, n / max(n + 10, 50)))
+                self.lbl_estado.configure(text=f"Procesados: {n} ({mb_done:.1f} MB…)")
         self.root.after(0, _do)
+
+    def _calcular_total_bytes(self, origen: str, destinos_count: int) -> None:
+        """Hilo de fondo: suma el tamaño de todos los archivos del origen
+        y actualiza _progress_total_bytes. No penaliza la copia porque
+        corre en paralelo y solo hace stat() sin leer contenido."""
+        total = 0
+        try:
+            cfg = self.config
+            from .constants import DICCIONARIO_EXTENSIONES
+            import re as _re
+            for raiz, _, ficheros in os.walk(origen):
+                for nombre in ficheros:
+                    ruta = Path(raiz) / nombre
+                    try:
+                        ext = ruta.suffix.lower()
+                        # Respetar los mismos filtros que SyncEngine._pasa_filtros
+                        if cfg.regex_excluir:
+                            if _re.search(cfg.regex_excluir, nombre):
+                                continue
+                        if ext in DICCIONARIO_EXTENSIONES["fotos"] and not cfg.chk_fotos:
+                            continue
+                        if ext in DICCIONARIO_EXTENSIONES["videos"] and not cfg.chk_videos:
+                            continue
+                        if ext in DICCIONARIO_EXTENSIONES["documentos"] and not cfg.chk_docs:
+                            continue
+                        total += ruta.stat().st_size
+                    except OSError:
+                        continue
+        except Exception as exc:
+            logger.debug("_calcular_total_bytes error: %s", exc)
+        # Multiplicar por número de destinos (la copia se hace N veces)
+        with self._progress_lock:
+            self._progress_total_bytes = total * destinos_count
+        logger.debug("Total estimado: %.1f MB", total * destinos_count / (1024 * 1024))
 
     # ------------------------------------------------------------------
     # Gestión de destinos múltiples
@@ -692,9 +769,18 @@ class CopyFilesApp:
 
         # ── LANZAR N motores en paralelo, uno por destino ────────────────
         self.contador_archivos = 0
-        self.bytes_processed = 0
+        with self._progress_lock:
+            self._progress_done_bytes = 0
+            self._progress_total_bytes = 0
         self.progress_bar.set(0)
         self._sync_engines: list[SyncEngine] = []
+
+        # Hilo de cálculo del total (no bloquea el inicio de la copia)
+        threading.Thread(
+            target=self._calcular_total_bytes,
+            args=(cfg.origen, len(destinos)),
+            daemon=True,
+        ).start()
 
         import dataclasses
         pendientes = [True] * len(destinos)   # un slot por motor
@@ -732,6 +818,123 @@ class CopyFilesApp:
         self.lbl_estado.configure(
             text=f"{self.t('lbl_estado_on')} ({n} destino{'s' if n > 1 else ''})"
         )
+
+    # ------------------------------------------------------------------
+    # Sesiones guardadas
+    # ------------------------------------------------------------------
+    def _refrescar_combo_sesiones(self) -> None:
+        nombres = ["— Nueva sesión —"] + self.session_manager.names()
+        self.combo_sesiones.configure(values=nombres)
+
+    def _on_sesion_seleccionada(self, nombre: str) -> None:
+        if nombre == "— Nueva sesión —":
+            self.lbl_ses_vol.configure(text="")
+            return
+        ses = self.session_manager.get(nombre)
+        if not ses:
+            return
+        # Mostrar estado de discos (conectado / desconectado)
+        partes = []
+        for dr in [ses.origen] + ses.destinos:
+            resuelto = dr.resolve()
+            ok = Path(resuelto).exists()
+            icono = "✅" if ok else "⚠️"
+            label = dr.label or Path(dr.path).anchor
+            partes.append(f"{icono}{label}({dr.volume_id[:6]})")
+        self.lbl_ses_vol.configure(text="  ".join(partes))
+
+    def _guardar_sesion_ui(self) -> None:
+        from tkinter.simpledialog import askstring
+        nombre = askstring("Guardar sesión", "Nombre para esta sesión:",
+                           initialvalue=self.combo_sesiones.get()
+                           if self.combo_sesiones.get() != "— Nueva sesión —" else "")
+        if not nombre or not nombre.strip():
+            return
+        nombre = nombre.strip()
+
+        origen_path = self.txt_origen.get().strip()
+        destinos_paths = self._get_destinos()
+
+        ses = Session(
+            name=nombre,
+            origen=DiskRef.from_path(origen_path) if origen_path else DiskRef(""),
+            destinos=[DiskRef.from_path(d) for d in destinos_paths],
+            config_snapshot={
+                "patron_renombrado": self.patron_renombrado_var.get(),
+                "chk_fotos": self.chk_fotos_var.get(),
+                "chk_videos": self.chk_videos_var.get(),
+                "chk_docs": self.chk_docs_var.get(),
+                "chk_otros": self.chk_otros_var.get(),
+                "modo_mover": self.radio_accion_var.get(),
+                "colision": self.colision_var.get(),
+            },
+        )
+        self.session_manager.save_session(ses)
+        self._refrescar_combo_sesiones()
+        self.combo_sesiones.set(nombre)
+        self._on_sesion_seleccionada(nombre)
+        messagebox.showinfo("Sesión guardada", f"Sesión «{nombre}» guardada correctamente.")
+
+    def _cargar_sesion_ui(self) -> None:
+        nombre = self.combo_sesiones.get()
+        if nombre == "— Nueva sesión —":
+            messagebox.showinfo("Sesiones", "Selecciona una sesión del desplegable para cargarla.")
+            return
+        ses = self.session_manager.get(nombre)
+        if not ses:
+            return
+
+        # Resolver rutas (puede haber cambiado la letra de unidad)
+        origen_resuelto = ses.origen.resolve()
+        if not Path(origen_resuelto).exists():
+            resp = messagebox.askyesno(
+                "Disco no disponible",
+                f"El disco origen «{ses.origen.label or ses.origen.path}» "
+                f"(ID: {ses.origen.volume_id}) no se detecta.\n\n"
+                "¿Cargar la sesión de todas formas con las rutas guardadas?",
+            )
+            if not resp:
+                return
+
+        self.txt_origen.delete(0, "end")
+        self.txt_origen.insert(0, origen_resuelto)
+
+        # Limpiar y repoblar destinos
+        for item in self.lista_destinos.get_children():
+            self.lista_destinos.delete(item)
+        for dr in ses.destinos:
+            resuelto = dr.resolve()
+            existe = Path(resuelto).exists()
+            label_extra = "" if existe else " ⚠️ (no disponible)"
+            self.lista_destinos.insert("", "end", values=(resuelto + label_extra,))
+
+        # Restaurar config snapshot
+        snap = ses.config_snapshot
+        if snap:
+            self.patron_renombrado_var.set(snap.get("patron_renombrado", self.patron_renombrado_var.get()))
+            self.chk_fotos_var.set(snap.get("chk_fotos", True))
+            self.chk_videos_var.set(snap.get("chk_videos", False))
+            self.chk_docs_var.set(snap.get("chk_docs", False))
+            self.chk_otros_var.set(snap.get("chk_otros", False))
+            self.radio_accion_var.set(snap.get("modo_mover", "copiar"))
+            self.colision_var.set(snap.get("colision", "renombrar"))
+
+        ses.mark_used()
+        self.session_manager.save_session(ses)
+        self._on_sesion_seleccionada(nombre)
+        self._guardar_config_live()
+        messagebox.showinfo("Sesión cargada", f"Sesión «{nombre}» cargada.")
+
+    def _borrar_sesion_ui(self) -> None:
+        nombre = self.combo_sesiones.get()
+        if nombre == "— Nueva sesión —":
+            return
+        if not messagebox.askyesno("Borrar sesión", f"¿Eliminar la sesión «{nombre}»?"):
+            return
+        self.session_manager.delete(nombre)
+        self._refrescar_combo_sesiones()
+        self.combo_sesiones.set("— Nueva sesión —")
+        self.lbl_ses_vol.configure(text="")
 
     def _restaurar_destinos(self) -> None:
         """Carga la lista de destinos guardada (JSON) en config.destino."""
@@ -916,37 +1119,339 @@ class CopyFilesApp:
             from tkinter import messagebox as mb
             mb.showerror("Error", "No se pudo exportar el CSV. Revisa el log.")
 
+    def _dbl_click_dup_tree(self, event) -> None:
+        """Doble clic: abre preview en imagen individual, o comparador en grupo SIMILAR."""
+        item_id = self.tree_dup.identify_row(event.y)
+        if not item_id:
+            return
+        parent = self.tree_dup.parent(item_id)
+        if not parent:
+            # Clic en fila padre: si es grupo SIMILAR, lanzar comparador con todos sus hijos
+            texto_padre = self.tree_dup.item(item_id, "text")
+            if "SIMILAR" in texto_padre:
+                rutas = []
+                for hijo in self.tree_dup.get_children(item_id):
+                    v = self.tree_dup.item(hijo, "values")
+                    n = self.tree_dup.item(hijo, "text")
+                    if v:
+                        rutas.append(str(Path(v[0]) / n))
+                if len(rutas) >= 2:
+                    self._abrir_comparador_similares(rutas)
+            return
+
+        valores = self.tree_dup.item(item_id, "values")
+        if not valores:
+            return
+        nombre = self.tree_dup.item(item_id, "text")
+        ruta_abs = str(Path(valores[0]) / nombre)
+        ext = Path(ruta_abs).suffix.lower()
+        if ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}:
+            # Si el padre es grupo SIMILAR y hay hermanos, abrir comparador
+            texto_padre = self.tree_dup.item(parent, "text")
+            if "SIMILAR" in texto_padre:
+                hermanos = self.tree_dup.get_children(parent)
+                rutas = []
+                for h in hermanos:
+                    v = self.tree_dup.item(h, "values")
+                    n = self.tree_dup.item(h, "text")
+                    if v:
+                        rutas.append(str(Path(v[0]) / n))
+                if len(rutas) >= 2:
+                    self._abrir_comparador_similares(rutas, destacar=ruta_abs)
+                    return
+            self._abrir_preview_imagen(ruta_abs)
+
+    def _single_click_dup_tree(self, event) -> None:
+        """Clic simple: alterna MANTENER / ELIMINAR en filas hijo."""
+        item_id = self.tree_dup.identify_row(event.y)
+        if not item_id or not self.tree_dup.parent(item_id):
+            return
+        valores = self.tree_dup.item(item_id, "values")
+        if not valores or len(valores) < 3 or valores[2] == "Grupo":
+            return
+        nueva = "MANTENER" if valores[2] == "ELIMINAR" else "ELIMINAR"
+        self.tree_dup.set(item_id, column=2, value=nueva)
+        self.tree_dup.item(item_id, tags=("tag_mantener" if nueva == "MANTENER" else "tag_eliminar",))
+        self._recalcular_ahorro_espacio()
+
+    def _ctx_menu_dup_tree(self, event) -> None:
+        """Clic derecho: menú contextual con 'Abrir carpeta' y 'Preview'."""
+        item_id = self.tree_dup.identify_row(event.y)
+        if not item_id:
+            return
+        self.tree_dup.selection_set(item_id)
+        parent = self.tree_dup.parent(item_id)
+
+        menu = tk.Menu(self.root, tearoff=0)
+
+        if parent:  # fila hijo
+            valores = self.tree_dup.item(item_id, "values")
+            nombre = self.tree_dup.item(item_id, "text")
+            ruta_abs = str(Path(valores[0]) / nombre) if valores else ""
+            carpeta = str(valores[0]) if valores else ""
+            ext = Path(ruta_abs).suffix.lower() if ruta_abs else ""
+
+            menu.add_command(
+                label="📂 Abrir carpeta contenedora",
+                command=lambda: self._abrir_carpeta_en_explorador(carpeta),
+            )
+            if ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}:
+                menu.add_separator()
+                menu.add_command(
+                    label="🔍 Previsualizar imagen",
+                    command=lambda: self._abrir_preview_imagen(ruta_abs),
+                )
+                texto_padre = self.tree_dup.item(parent, "text")
+                if "SIMILAR" in texto_padre:
+                    rutas = [
+                        str(Path(self.tree_dup.item(h, "values")[0]) / self.tree_dup.item(h, "text"))
+                        for h in self.tree_dup.get_children(parent)
+                        if self.tree_dup.item(h, "values")
+                    ]
+                    if len(rutas) >= 2:
+                        menu.add_command(
+                            label="⚖️ Comparar con grupo",
+                            command=lambda: self._abrir_comparador_similares(rutas, destacar=ruta_abs),
+                        )
+        else:  # fila padre
+            texto_padre = self.tree_dup.item(item_id, "text")
+            if "SIMILAR" in texto_padre:
+                rutas = [
+                    str(Path(self.tree_dup.item(h, "values")[0]) / self.tree_dup.item(h, "text"))
+                    for h in self.tree_dup.get_children(item_id)
+                    if self.tree_dup.item(h, "values")
+                ]
+                if len(rutas) >= 2:
+                    menu.add_command(
+                        label="⚖️ Comparar imágenes similares",
+                        command=lambda: self._abrir_comparador_similares(rutas),
+                    )
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _abrir_carpeta_en_explorador(self, carpeta: str) -> None:
+        """Abre el explorador del sistema en la carpeta indicada."""
+        import subprocess, sys as _sys
+        if not carpeta or not Path(carpeta).exists():
+            messagebox.showwarning("Carpeta no encontrada", f"La carpeta no existe:\n{carpeta}")
+            return
+        try:
+            if _sys.platform == "win32":
+                os.startfile(carpeta)
+            elif _sys.platform == "darwin":
+                subprocess.Popen(["open", carpeta])
+            else:
+                subprocess.Popen(["xdg-open", carpeta])
+        except Exception as exc:
+            messagebox.showerror("Error", f"No se pudo abrir el explorador:\n{exc}")
+
     def _abrir_preview_imagen(self, ruta_abs: str) -> None:
-        """Mejora #1: preview de imagen duplicada en ventana flotante."""
+        """Preview individual de imagen con botón de acción rápida MANTENER/ELIMINAR."""
         try:
             from PIL import Image, ImageTk
         except ImportError:
-            from tkinter import messagebox as mb
-            mb.showwarning("Pillow no instalado", "Instala Pillow para previsualizar imágenes:\npip install Pillow")
+            messagebox.showwarning("Pillow no instalado", "pip install Pillow")
             return
 
         p = Path(ruta_abs)
-        if not p.exists() or p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".tiff"}:
+        if not p.exists():
+            messagebox.showwarning("Archivo no encontrado", str(p))
             return
 
         win = ctk.CTkToplevel(self.root)
         win.title(f"Preview: {p.name}")
-        win.geometry("600x480")
+        win.geometry("660x520")
         win.grab_set()
 
         try:
             img = Image.open(ruta_abs)
-            img.thumbnail((560, 380))
+            orig_w, orig_h = img.size
+            img.thumbnail((600, 380))
             photo = ImageTk.PhotoImage(img)
             lbl_img = tk.Label(win, image=photo, bg="#1a1a1a")
-            lbl_img.image = photo  # keep reference
+            lbl_img.image = photo
             lbl_img.pack(padx=10, pady=10)
         except Exception as exc:
-            ctk.CTkLabel(win, text=f"No se pudo cargar la imagen:\n{exc}").pack(padx=20, pady=20)
+            ctk.CTkLabel(win, text=f"No se pudo cargar:\n{exc}").pack(padx=20, pady=20)
+            orig_w, orig_h = 0, 0
 
-        info = f"{p.name}\nTamaño: {p.stat().st_size / (1024*1024):.2f} MB\nRuta: {p.parent}"
-        ctk.CTkLabel(win, text=info, font=("Consolas", 10), justify="left").pack(padx=10, pady=5)
-        ctk.CTkButton(win, text="Cerrar", command=win.destroy, width=100).pack(pady=8)
+        info = (f"{p.name}   |   {orig_w}×{orig_h} px   |   "
+                f"{p.stat().st_size / (1024*1024):.2f} MB\n{p.parent}")
+        ctk.CTkLabel(win, text=info, font=("Consolas", 10), justify="left").pack(padx=10)
+
+        f_btns = ctk.CTkFrame(win, fg_color="transparent")
+        f_btns.pack(pady=8)
+
+        def _set_accion(accion: str):
+            # Buscar el item del tree que corresponde a esta ruta y cambiar su acción
+            for padre in self.tree_dup.get_children():
+                for hijo in self.tree_dup.get_children(padre):
+                    v = self.tree_dup.item(hijo, "values")
+                    n = self.tree_dup.item(hijo, "text")
+                    if v and str(Path(v[0]) / n) == ruta_abs:
+                        self.tree_dup.set(hijo, column=2, value=accion)
+                        self.tree_dup.item(hijo, tags=(
+                            "tag_mantener" if accion == "MANTENER" else "tag_eliminar",))
+                        self._recalcular_ahorro_espacio()
+                        break
+            win.destroy()
+
+        ctk.CTkButton(f_btns, text="✅ MANTENER", fg_color="#2e7d32", hover_color="#1b5e20",
+                      command=lambda: _set_accion("MANTENER"), width=140).pack(side="left", padx=8)
+        ctk.CTkButton(f_btns, text="🗑️ ELIMINAR", fg_color="#b71c1c", hover_color="#7f0000",
+                      command=lambda: _set_accion("ELIMINAR"), width=140).pack(side="left", padx=8)
+        ctk.CTkButton(f_btns, text="📂 Abrir carpeta",
+                      command=lambda: self._abrir_carpeta_en_explorador(str(p.parent)),
+                      width=140).pack(side="left", padx=8)
+        ctk.CTkButton(f_btns, text="Cerrar", command=win.destroy, width=80).pack(side="left", padx=8)
+
+    def _abrir_comparador_similares(self, rutas: list[str],
+                                     destacar: str | None = None) -> None:
+        """Ventana comparadora: muestra hasta 4 imágenes en grid + mapa de diferencias."""
+        try:
+            from PIL import Image, ImageTk, ImageChops, ImageEnhance, ImageFilter
+        except ImportError:
+            messagebox.showwarning("Pillow no instalado", "pip install Pillow")
+            return
+
+        rutas = [r for r in rutas if Path(r).exists()]
+        if len(rutas) < 2:
+            return
+
+        # Limitar a 4 para que la UI sea manejable
+        rutas = rutas[:4]
+        n = len(rutas)
+
+        win = ctk.CTkToplevel(self.root)
+        win.title(f"Comparador de imágenes similares ({n} archivos)")
+        win.geometry("1100x680")
+        win.grab_set()
+
+        # ── Panel superior: imágenes en fila ────────────────────────────
+        THUMB = (240, 200)
+
+        f_imgs = ctk.CTkFrame(win, fg_color="#111111")
+        f_imgs.pack(fill="x", padx=10, pady=8)
+
+        imagenes_pil: list[Image.Image] = []
+        photos: list[ImageTk.PhotoImage] = []
+        acciones_vars: list[tk.StringVar] = []
+
+        for idx, ruta in enumerate(rutas):
+            p = Path(ruta)
+            f_col = ctk.CTkFrame(f_imgs, fg_color="#1a1a1a", corner_radius=6)
+            f_col.pack(side="left", padx=6, pady=6, expand=True, fill="both")
+
+            try:
+                img = Image.open(ruta).convert("RGB")
+                imagenes_pil.append(img)
+                thumb = img.copy()
+                thumb.thumbnail(THUMB)
+                ph = ImageTk.PhotoImage(thumb)
+                photos.append(ph)
+                borde = "#ffcc00" if ruta == destacar else "#333333"
+                lbl = tk.Label(f_col, image=ph, bg=borde, bd=3, relief="solid")
+                lbl.image = ph
+                lbl.pack(padx=4, pady=4)
+            except Exception:
+                imagenes_pil.append(None)
+                photos.append(None)
+                ctk.CTkLabel(f_col, text="Error\ncargando").pack(padx=8, pady=40)
+
+            sz = p.stat().st_size / (1024 * 1024) if p.exists() else 0
+            ctk.CTkLabel(f_col, text=p.name, font=("Segoe UI", 9, "bold"),
+                         wraplength=230).pack(padx=4)
+            ctk.CTkLabel(f_col, text=f"{sz:.2f} MB · {str(p.parent)[-30:]}",
+                         font=("Consolas", 8), text_color="#888888",
+                         wraplength=230).pack(padx=4)
+
+            # Selector de acción por imagen
+            var = tk.StringVar(value="MANTENER" if idx == 0 else "ELIMINAR")
+            acciones_vars.append(var)
+
+            def _make_toggle(v=var, r=ruta, fc=f_col):
+                def _toggle():
+                    nuevo = "ELIMINAR" if v.get() == "MANTENER" else "MANTENER"
+                    v.set(nuevo)
+                    fc.configure(fg_color="#1a2e1a" if nuevo == "MANTENER" else "#2e1a1a")
+                    # Sincronizar con el treeview
+                    for padre in self.tree_dup.get_children():
+                        for hijo in self.tree_dup.get_children(padre):
+                            vv = self.tree_dup.item(hijo, "values")
+                            nn = self.tree_dup.item(hijo, "text")
+                            if vv and str(Path(vv[0]) / nn) == r:
+                                self.tree_dup.set(hijo, column=2, value=nuevo)
+                                self.tree_dup.item(hijo, tags=(
+                                    "tag_mantener" if nuevo == "MANTENER" else "tag_eliminar",))
+                                self._recalcular_ahorro_espacio()
+                                return
+                return _toggle
+
+            btn_toggle = ctk.CTkButton(
+                f_col, textvariable=var, width=110,
+                fg_color="#2e7d32" if var.get() == "MANTENER" else "#b71c1c",
+                command=_make_toggle(),
+            )
+            # Re-colorear al pulsar
+            _orig_cmd = btn_toggle.cget("command")
+            def _colored_cmd(b=btn_toggle, v=var, cmd=_make_toggle()):
+                cmd()
+                b.configure(fg_color="#2e7d32" if v.get() == "MANTENER" else "#b71c1c")
+            btn_toggle.configure(command=_colored_cmd)
+            btn_toggle.pack(pady=4)
+
+        # ── Panel inferior: mapa de diferencias ─────────────────────────
+        f_diff = ctk.CTkFrame(win, fg_color="#111111")
+        f_diff.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        ctk.CTkLabel(f_diff, text="🔬 Mapa de diferencias (ampliado 5×)",
+                     font=("Segoe UI", 10, "bold")).pack(pady=(6, 2))
+
+        lbl_diff = tk.Label(f_diff, bg="#111111")
+        lbl_diff.pack(padx=8, pady=4)
+
+        def _calcular_diff(idx_a: int = 0, idx_b: int = 1) -> None:
+            img_a = imagenes_pil[idx_a] if idx_a < len(imagenes_pil) else None
+            img_b = imagenes_pil[idx_b] if idx_b < len(imagenes_pil) else None
+            if img_a is None or img_b is None:
+                return
+            try:
+                # Igualar tamaño para la resta
+                size = (min(img_a.width, img_b.width, 480),
+                        min(img_a.height, img_b.height, 200))
+                a_res = img_a.resize(size, Image.LANCZOS)
+                b_res = img_b.resize(size, Image.LANCZOS)
+                diff = ImageChops.difference(a_res, b_res)
+                # Amplificar 5× y añadir suavizado leve para destacar contornos
+                diff = ImageEnhance.Brightness(diff).enhance(5.0)
+                diff = diff.filter(ImageFilter.SMOOTH)
+                ph_diff = ImageTk.PhotoImage(diff)
+                lbl_diff.configure(image=ph_diff)
+                lbl_diff.image = ph_diff
+            except Exception as exc:
+                lbl_diff.configure(text=f"Error calculando diferencias: {exc}")
+
+        # Controles de selección de par a comparar
+        f_sel = ctk.CTkFrame(win, fg_color="transparent")
+        f_sel.pack(pady=4)
+        ctk.CTkLabel(f_sel, text="Comparar imágenes:").pack(side="left", padx=6)
+        nombres = [Path(r).name[:20] for r in rutas]
+        var_a = tk.IntVar(value=0)
+        var_b = tk.IntVar(value=1)
+        for i, nm in enumerate(nombres):
+            ctk.CTkRadioButton(f_sel, text=f"A={nm}", variable=var_a, value=i,
+                               command=lambda: _calcular_diff(var_a.get(), var_b.get())
+                               ).pack(side="left", padx=3)
+        ctk.CTkLabel(f_sel, text="  vs  ").pack(side="left")
+        for i, nm in enumerate(nombres):
+            ctk.CTkRadioButton(f_sel, text=f"B={nm}", variable=var_b, value=i,
+                               command=lambda: _calcular_diff(var_a.get(), var_b.get())
+                               ).pack(side="left", padx=3)
+
+        ctk.CTkButton(win, text="Cerrar", command=win.destroy, width=100).pack(pady=6)
+
+        # Calcular diferencia inicial
+        win.after(100, lambda: _calcular_diff(0, 1))
 
     def _recalcular_ahorro_espacio(self) -> None:
         total_bytes = 0
@@ -958,7 +1463,6 @@ class CopyFilesApp:
                 if valores[2] not in ("ELIMINAR", "DELETE"):
                     continue
                 try:
-                    # valores[1] es "X.XX MB" — extraer el número
                     mb_val = float(str(valores[1]).split()[0])
                     total_bytes += mb_val * 1024 * 1024
                 except (ValueError, IndexError):
@@ -967,43 +1471,9 @@ class CopyFilesApp:
         clave = "disk_saving_dry" if self.dry_run_var.get() else "disk_saving_real"
         self.lbl_saving_dup.configure(text=self.t(clave, megas=mb))
 
-    def _dbl_click_dup_tree(self, event) -> None:
-        """Mejora #1: doble-clic en hijo abre preview si es imagen, en padre alterna."""
-        item_id = self.tree_dup.identify_row(event.y)
-        if not item_id:
-            return
-        # ¿Es hijo (tiene padre)?
-        parent = self.tree_dup.parent(item_id)
-        if parent:
-            valores = self.tree_dup.item(item_id, "values")
-            if valores:
-                nombre = self.tree_dup.item(item_id, "text")
-                ruta_abs = str(Path(valores[0]) / nombre)
-                ext = Path(ruta_abs).suffix.lower()
-                if ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}:
-                    self._abrir_preview_imagen(ruta_abs)
-                    return
-        self._alternar_accion_item_dup(event)
-
     def _alternar_accion_item_dup(self, event) -> None:
-        item_id = self.tree_dup.identify_row(event.y)
-        if not item_id:
-            return
-        # Ignorar filas padre (no tienen parent)
-        if not self.tree_dup.parent(item_id):
-            return
-        valores = self.tree_dup.item(item_id, "values")
-        if not valores or len(valores) < 3:
-            return
-        accion_actual = valores[2]
-        if accion_actual == "Grupo":
-            return
-
-        nueva_accion = "MANTENER" if accion_actual == "ELIMINAR" else "ELIMINAR"
-        # Usar índice de columna en lugar de nombre con tilde (más robusto cross-platform)
-        self.tree_dup.set(item_id, column=2, value=nueva_accion)
-        self.tree_dup.item(item_id, tags=("tag_mantener" if nueva_accion == "MANTENER" else "tag_eliminar",))
-        self._recalcular_ahorro_espacio()
+        """Compatibilidad interna; delega a _single_click_dup_tree."""
+        self._single_click_dup_tree(event)
 
     def _ejecutar_limpieza_duplicados(self) -> None:
         metodo = self.metodo_borrado_var.get()

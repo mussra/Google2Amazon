@@ -27,6 +27,8 @@ from .localization import Translator
 from .models import AppConfig
 from .persistence import HashCache, HistoryManager
 from .sessions import SessionManager, Session, DiskRef, get_volume_id
+from .mirror_engine import MirrorEngine, MirrorOptions, MirrorDiff
+from .regex_wizard import RegexWizard
 from .sync_engine import SyncEngine
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,8 @@ class CopyFilesApp:
         self.duplicados_en_progreso = False
         self.progreso_hilos: dict[str, str] = {}
         self.session_manager = SessionManager()
+        self.mirror_engine = MirrorEngine(hash_cache=self.hash_cache)
+        self._mirror_diffs: list[MirrorDiff] = []
         # Progreso real: total de bytes a copiar (calculado en hilo de fondo)
         self._progress_total_bytes: int = 0
         self._progress_done_bytes: int = 0
@@ -166,10 +170,12 @@ class CopyFilesApp:
 
         self.tab_sincro = self.notebook.add("tab_sincro")
         self.tab_dup = self.notebook.add("tab_duplicados")
+        self.tab_espejo = self.notebook.add("tab_espejo")
         self.tab_avanzado = self.notebook.add("tab_avanzado")
 
         self._construir_tab_sincronizacion()
         self._construir_tab_duplicados()
+        self._construir_tab_espejo()
         self._construir_tab_avanzado()
 
     def _construir_tab_sincronizacion(self) -> None:
@@ -342,6 +348,12 @@ class CopyFilesApp:
         )
         self.btn_analizar_dup.pack(side="left", padx=4)
 
+        ctk.CTkButton(
+            f_fila2, text="🏷️ Reglas de marcado", width=160,
+            fg_color="#37474f", hover_color="#455a64",
+            command=self._abrir_wizard_marcado,
+        ).pack(side="left", padx=8)
+
         f_perf = ctk.CTkFrame(self.tab_dup)
         f_perf.pack(fill="x", padx=15, pady=5)
         self.txt_consola_perf = ctk.CTkTextbox(f_perf, height=80, font=("Consolas", 10),
@@ -394,6 +406,106 @@ class CopyFilesApp:
                                                hover_color="#c62828", state="disabled",
                                                command=self._ejecutar_limpieza_duplicados, width=220)
         self.btn_ejecutar_dup.pack(side="right", padx=10)
+
+    def _construir_tab_espejo(self) -> None:
+        """Tab de sincronización bidireccional (espejo bajo demanda)."""
+        # ── Directorios espejo ────────────────────────────────────────
+        f_top = ctk.CTkFrame(self.tab_espejo)
+        f_top.pack(fill="x", padx=15, pady=10)
+        ctk.CTkLabel(f_top, text="📂 Directorios a mantener como espejo:",
+                     font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=10, pady=4)
+
+        f_lista = ctk.CTkFrame(f_top, fg_color="transparent")
+        f_lista.pack(fill="x", padx=8, pady=4)
+        self.lista_espejo = tk.ttk.Treeview(f_lista, columns=("Vol",), show="headings", height=4)
+        self.lista_espejo.heading("Vol", text="Directorio (se añaden todos los que quieras espejar)")
+        self.lista_espejo.column("Vol", anchor="w")
+        self.lista_espejo.pack(side="left", fill="x", expand=True)
+
+        f_esp_btns = ctk.CTkFrame(f_top, fg_color="transparent")
+        f_esp_btns.pack(side="right", padx=8, pady=4)
+        ctk.CTkButton(f_esp_btns, text="➕ Añadir dir.", width=110,
+                      command=self._agregar_dir_espejo).pack(pady=2)
+        ctk.CTkButton(f_esp_btns, text="➖ Quitar", width=110,
+                      fg_color="#b71c1c", hover_color="#c62828",
+                      command=self._quitar_dir_espejo).pack(pady=2)
+
+        # ── Opciones ──────────────────────────────────────────────────
+        f_opts = ctk.CTkFrame(self.tab_espejo, fg_color="transparent")
+        f_opts.pack(fill="x", padx=15, pady=4)
+        self.mir_fotos_var = tk.BooleanVar(value=True)
+        self.mir_videos_var = tk.BooleanVar(value=True)
+        self.mir_docs_var = tk.BooleanVar(value=True)
+        self.mir_otros_var = tk.BooleanVar(value=True)
+        self.mir_hash_var = tk.BooleanVar(value=False)
+        self.mir_contenido_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(f_opts, text="📷 Fotos", variable=self.mir_fotos_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(f_opts, text="🎥 Vídeos", variable=self.mir_videos_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(f_opts, text="📄 Docs", variable=self.mir_docs_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(f_opts, text="📦 Otros", variable=self.mir_otros_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(f_opts, text="🔑 Verificar integridad (mismo nombre, distinto contenido)",
+                        variable=self.mir_hash_var).pack(side="left", padx=12)
+        ctk.CTkCheckBox(
+            f_opts,
+            text="🔍 Comparar por contenido (ignora nombre — detecta fotos renombradas)",
+            variable=self.mir_contenido_var,
+        ).pack(side="left", padx=12)
+
+        # ── Botones de acción ─────────────────────────────────────────
+        f_acc = ctk.CTkFrame(self.tab_espejo, fg_color="transparent")
+        f_acc.pack(fill="x", padx=15, pady=6)
+        self.btn_analizar_espejo = ctk.CTkButton(
+            f_acc, text="🔍 Analizar diferencias", width=200,
+            fg_color="#0052cc", hover_color="#0043a4",
+            command=self._analizar_espejo)
+        self.btn_analizar_espejo.pack(side="left", padx=6)
+        self.btn_sincronizar_espejo = ctk.CTkButton(
+            f_acc, text="⚡ Sincronizar ahora", width=200,
+            fg_color="#1b5e20", hover_color="#2e7d32",
+            state="disabled", command=self._sincronizar_espejo)
+        self.btn_sincronizar_espejo.pack(side="left", padx=6)
+        self.btn_cancelar_espejo = ctk.CTkButton(
+            f_acc, text="⏹ Cancelar", width=120,
+            fg_color="#b71c1c", hover_color="#7f0000",
+            state="disabled", command=self._cancelar_espejo)
+        self.btn_cancelar_espejo.pack(side="left", padx=6)
+
+        self.lbl_espejo_status = ctk.CTkLabel(
+            f_acc, text="Añade directorios y pulsa Analizar.", font=("Segoe UI", 10))
+        self.lbl_espejo_status.pack(side="left", padx=12)
+
+        # ── Progress bar ──────────────────────────────────────────────
+        self.progress_espejo = ctk.CTkProgressBar(self.tab_espejo)
+        self.progress_espejo.pack(fill="x", padx=15, pady=4)
+        self.progress_espejo.set(0)
+
+        # ── Árbol de resultados ───────────────────────────────────────
+        f_arbol = ctk.CTkFrame(self.tab_espejo)
+        f_arbol.pack(fill="both", expand=True, padx=15, pady=6)
+        self.tree_espejo = tk.ttk.Treeview(
+            f_arbol, columns=("Origen", "Destino", "Tamaño", "Estado"), show="tree headings")
+        self.tree_espejo.heading("#0", text="Archivo")
+        self.tree_espejo.heading("Origen", text="Directorio origen")
+        self.tree_espejo.heading("Destino", text="Directorio destino")
+        self.tree_espejo.heading("Tamaño", text="Tamaño")
+        self.tree_espejo.heading("Estado", text="Estado")
+        self.tree_espejo.column("#0", width=260, anchor="w")
+        self.tree_espejo.column("Origen", width=180, anchor="w")
+        self.tree_espejo.column("Destino", width=180, anchor="w")
+        self.tree_espejo.column("Tamaño", width=90, anchor="e")
+        self.tree_espejo.column("Estado", width=100, anchor="center")
+        self.tree_espejo.tag_configure("pendiente", foreground="#ff8f00")
+        self.tree_espejo.tag_configure("ok", foreground="#2e7d32")
+        self.tree_espejo.tag_configure("error", foreground="#b71c1c")
+        scr_e = tk.ttk.Scrollbar(f_arbol, orient="vertical", command=self.tree_espejo.yview)
+        self.tree_espejo.configure(yscrollcommand=scr_e.set)
+        self.tree_espejo.pack(side="left", fill="both", expand=True)
+        scr_e.pack(side="right", fill="y")
+        self.tree_espejo.bind("<Button-3>", self._ctx_espejo)
+
+        # ── Log ───────────────────────────────────────────────────────
+        self.txt_log_espejo = ctk.CTkTextbox(self.tab_espejo, height=100, font=("Consolas", 10))
+        self.txt_log_espejo.pack(fill="x", padx=15, pady=(0, 8))
 
     def _construir_tab_avanzado(self) -> None:
         self.scrollable_frame_avanzado = ctk.CTkScrollableFrame(self.tab_avanzado)
@@ -468,9 +580,13 @@ class CopyFilesApp:
 
         self.wizard_regex_clean = ctk.CTkLabel(f_wizard, text=self.t("wizard_regex_clean"))
         self.wizard_regex_clean.grid(row=4, column=0, padx=15, pady=5, sticky="w")
-        ent_w_b = ctk.CTkEntry(f_wizard, textvariable=self.ren_regex_busca_var, width=180)
-        ent_w_b.grid(row=4, column=1, padx=15, pady=5, sticky="w")
+        f_rx_busca = ctk.CTkFrame(f_wizard, fg_color="transparent")
+        f_rx_busca.grid(row=4, column=1, padx=15, pady=5, sticky="w")
+        ent_w_b = ctk.CTkEntry(f_rx_busca, textvariable=self.ren_regex_busca_var, width=180)
+        ent_w_b.pack(side="left")
         ent_w_b.bind("<KeyRelease>", lambda e: self._evaluar_preview_wizard())
+        ctk.CTkButton(f_rx_busca, text="🔧 Wizard", width=80, height=26,
+                      command=lambda: self._abrir_regex_wizard_renombrado()).pack(side="left", padx=6)
 
         self.wizard_regex_repl = ctk.CTkLabel(f_wizard, text=self.t("wizard_regex_repl"))
         self.wizard_regex_repl.grid(row=5, column=0, padx=15, pady=5, sticky="w")
@@ -576,6 +692,7 @@ class CopyFilesApp:
             botones = self.notebook._segmented_button._buttons_dict
             botones["tab_sincro"].configure(text=t("tab_sincro"))
             botones["tab_duplicados"].configure(text=t("tab_duplicados"))
+            botones["tab_espejo"].configure(text=t("tab_espejo"))
             botones["tab_avanzado"].configure(text=t("tab_avanzado"))
 
         widget_keys = {
@@ -1595,11 +1712,233 @@ class CopyFilesApp:
     # ------------------------------------------------------------------
     # Cierre
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Tab Espejo — lógica
+    # ------------------------------------------------------------------
+    def _agregar_dir_espejo(self) -> None:
+        ruta = filedialog.askdirectory(title="Seleccionar directorio espejo")
+        if not ruta:
+            return
+        existentes = [self.lista_espejo.item(i, "values")[0]
+                      for i in self.lista_espejo.get_children()]
+        if ruta not in existentes:
+            self.lista_espejo.insert("", "end", values=(ruta,))
+
+    def _quitar_dir_espejo(self) -> None:
+        for item in self.lista_espejo.selection():
+            self.lista_espejo.delete(item)
+
+    def _get_dirs_espejo(self) -> list[str]:
+        return [self.lista_espejo.item(i, "values")[0]
+                for i in self.lista_espejo.get_children()]
+
+    def _log_espejo(self, msg: str) -> None:
+        def _do():
+            self.txt_log_espejo.configure(state="normal")
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.txt_log_espejo.insert("end", f"[{ts}] {msg}\n")
+            self.txt_log_espejo.configure(state="disabled")
+            self.txt_log_espejo.see("end")
+        self.root.after(0, _do)
+
+    def _analizar_espejo(self) -> None:
+        dirs = self._get_dirs_espejo()
+        if len(dirs) < 2:
+            messagebox.showwarning("Espejo", "Añade al menos 2 directorios para comparar.")
+            return
+
+        for row in self.tree_espejo.get_children():
+            self.tree_espejo.delete(row)
+        self._mirror_diffs = []
+        self.progress_espejo.set(0)
+        self.btn_analizar_espejo.configure(state="disabled")
+        self.btn_cancelar_espejo.configure(state="normal")
+        self.btn_sincronizar_espejo.configure(state="disabled")
+        self.lbl_espejo_status.configure(text="⏳ Analizando…")
+        self.mirror_engine._cancelado.clear()
+
+        opts = MirrorOptions(
+            incluir_fotos=self.mir_fotos_var.get(),
+            incluir_videos=self.mir_videos_var.get(),
+            incluir_docs=self.mir_docs_var.get(),
+            incluir_otros=self.mir_otros_var.get(),
+            comparar_por_hash=self.mir_hash_var.get(),
+            comparar_por_contenido=self.mir_contenido_var.get(),
+        )
+
+        def _fondo():
+            diffs = self.mirror_engine.analizar(dirs, opts, self._log_espejo)
+            def _ui():
+                self._mirror_diffs = diffs
+                for d in diffs:
+                    sz = f"{d.size_bytes/(1024*1024):.2f} MB"
+                    self.tree_espejo.insert(
+                        "", "end", text=Path(d.ruta_relativa).name,
+                        values=(d.origen.parent.name, d.destino.parent.name, sz, "Pendiente"),
+                        tags=("pendiente",),
+                    )
+                n = len(diffs)
+                self.lbl_espejo_status.configure(
+                    text=f"{'✅ Todo sincronizado' if n == 0 else f'⚠️ {n} archivos pendientes de copiar'}")
+                self.btn_analizar_espejo.configure(state="normal")
+                self.btn_cancelar_espejo.configure(state="disabled")
+                if n > 0:
+                    self.btn_sincronizar_espejo.configure(state="normal")
+            self.root.after(0, _ui)
+
+        threading.Thread(target=_fondo, daemon=True).start()
+
+    def _sincronizar_espejo(self) -> None:
+        if not self._mirror_diffs:
+            return
+        self.btn_sincronizar_espejo.configure(state="disabled")
+        self.btn_analizar_espejo.configure(state="disabled")
+        self.btn_cancelar_espejo.configure(state="normal")
+        self.mirror_engine._cancelado.clear()
+        diffs = list(self._mirror_diffs)
+
+        def _progreso(copiados: int, total: int):
+            ratio = copiados / total if total else 0
+            def _ui():
+                self.progress_espejo.set(ratio)
+                self.lbl_espejo_status.configure(text=f"⚡ Copiando {copiados}/{total}…")
+                # Marcar filas como OK
+                hijos = self.tree_espejo.get_children()
+                idx = copiados - 1
+                if 0 <= idx < len(hijos):
+                    self.tree_espejo.set(hijos[idx], "Estado", "✅ Copiado")
+                    self.tree_espejo.item(hijos[idx], tags=("ok",))
+            self.root.after(0, _ui)
+
+        def _fondo():
+            ok, errores = self.mirror_engine.sincronizar(diffs, self._log_espejo, _progreso)
+            def _ui():
+                self.progress_espejo.set(1.0)
+                self.lbl_espejo_status.configure(
+                    text=f"🏁 Sincronizado: {ok} copiados, {errores} errores.")
+                self.btn_analizar_espejo.configure(state="normal")
+                self.btn_cancelar_espejo.configure(state="disabled")
+                self._mirror_diffs.clear()
+            self.root.after(0, _ui)
+
+        threading.Thread(target=_fondo, daemon=True).start()
+
+    def _cancelar_espejo(self) -> None:
+        self.mirror_engine.cancelar()
+        self.btn_cancelar_espejo.configure(state="disabled")
+        self.btn_analizar_espejo.configure(state="normal")
+        self.lbl_espejo_status.configure(text="🛑 Cancelado.")
+
+    def _ctx_espejo(self, event) -> None:
+        item = self.tree_espejo.identify_row(event.y)
+        if not item:
+            return
+        self.tree_espejo.selection_set(item)
+        vals = self.tree_espejo.item(item, "values")
+        if not vals:
+            return
+        nombre = self.tree_espejo.item(item, "text")
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"📂 Abrir origen ({vals[0]})",
+                         command=lambda: self._abrir_carpeta_en_explorador(
+                             str(next((d.origen.parent for d in self._mirror_diffs
+                                       if d.origen.name == nombre), Path(vals[0])))))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------------
+    # Wizard RegEx — renombrado
+    # ------------------------------------------------------------------
+    def _abrir_regex_wizard_renombrado(self) -> None:
+        """Abre el wizard con archivos de muestra tomados del origen configurado."""
+        origen = self.txt_origen.get().strip()
+        muestras: list[Path] = []
+        if origen and Path(origen).exists():
+            for raiz, _, fics in os.walk(origen):
+                for f in fics:
+                    muestras.append(Path(raiz) / f)
+                if len(muestras) >= 500:
+                    break
+
+        def _aplicar(expr: str):
+            self.ren_regex_busca_var.set(expr)
+            self._evaluar_preview_wizard()
+
+        RegexWizard(
+            parent=self.root,
+            titulo="Wizard RegEx — Filtro de renombrado",
+            on_confirm=_aplicar,
+            valor_inicial=self.ren_regex_busca_var.get(),
+            archivos_muestra=muestras,
+            modo_marcado=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Wizard RegEx — marcado de duplicados
+    # ------------------------------------------------------------------
+    def _abrir_wizard_marcado(self) -> None:
+        """Abre el wizard en modo marcado con los archivos del árbol de duplicados."""
+        muestras: list[Path] = []
+        for padre in self.tree_dup.get_children():
+            for hijo in self.tree_dup.get_children(padre):
+                v = self.tree_dup.item(hijo, "values")
+                n = self.tree_dup.item(hijo, "text")
+                if v:
+                    muestras.append(Path(v[0]) / n)
+
+        if not muestras:
+            # Sin análisis previo: tomar muestra del disco
+            for ruta in self._get_dirs_espejo() or [self.txt_origen.get().strip()]:
+                if Path(ruta).exists():
+                    for r, _, fics in os.walk(ruta):
+                        for f in fics:
+                            muestras.append(Path(r) / f)
+                        if len(muestras) >= 300:
+                            break
+
+        def _aplicar_marcado(expr: str, accion_match: str, accion_no_match: str):
+            import re as _re
+            campo_var = "nombre_archivo"   # el wizard ya habrá fijado el campo
+            try:
+                flags = _re.IGNORECASE
+                patron = _re.compile(expr, flags)
+            except _re.error:
+                return
+            n_marcados = 0
+            for padre in self.tree_dup.get_children():
+                for hijo in self.tree_dup.get_children(padre):
+                    v = self.tree_dup.item(hijo, "values")
+                    n = self.tree_dup.item(hijo, "text")
+                    if not v or len(v) < 3:
+                        continue
+                    p = Path(v[0]) / n
+                    # Evaluar según campo seleccionado en el wizard
+                    sujeto = p.stem   # nombre_archivo por defecto
+                    coincide = bool(patron.search(sujeto))
+                    accion = accion_match if coincide else accion_no_match
+                    self.tree_dup.set(hijo, column=2, value=accion)
+                    self.tree_dup.item(hijo, tags=(
+                        "tag_mantener" if accion == "MANTENER" else "tag_eliminar",))
+                    n_marcados += 1
+            self._recalcular_ahorro_espacio()
+            messagebox.showinfo("Reglas aplicadas",
+                                f"Regla aplicada a {n_marcados} archivos.\n"
+                                f"Coincide → {accion_match} | No coincide → {accion_no_match}")
+
+        RegexWizard(
+            parent=self.root,
+            titulo="Wizard RegEx — Reglas de marcado de duplicados",
+            on_confirm=_aplicar_marcado,
+            valor_inicial="",
+            archivos_muestra=muestras,
+            modo_marcado=True,
+        )
+
     def _al_cerrar(self) -> None:
         try:
             for eng in self._sync_engines:
                 eng.detener()
             self.dup_engine.cancelar()
+            self.mirror_engine.cancelar()
             self._guardar_config_live()
             self.hash_cache.close()
         finally:

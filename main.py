@@ -10,6 +10,7 @@ Requiere las dependencias listadas en requirements.txt:
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import sys
 
 import customtkinter as ctk
@@ -26,6 +27,10 @@ def configurar_logging() -> None:
 
 
 def main() -> None:
+    # freeze_support() es necesario cuando la app se empaqueta con PyInstaller
+    # en Windows y se usa ProcessPoolExecutor (start method = spawn).
+    # En desarrollo no hace nada.
+    multiprocessing.freeze_support()
     configurar_logging()
     app_root = ctk.CTk()
     app_root.geometry("1020x680")

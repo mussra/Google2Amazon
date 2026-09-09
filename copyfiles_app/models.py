@@ -48,6 +48,9 @@ class AppConfig:
     color_acento_personalizado: str = "#1f6aa5"
     color_fondo_paneles: str = "#2b2b2b"
 
+    modo_similitud_dup: str = "exact"          # "exact" | "similar"
+    umbral_similitud_dup: int = 10              # Hamming distance threshold
+
     # Campos heredados de versiones anteriores que ya no se usan pero se
     # toleran para no romper la carga de configuraciones antiguas.
     extra: dict = field(default_factory=dict, repr=False)

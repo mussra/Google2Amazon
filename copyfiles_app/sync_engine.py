@@ -189,7 +189,6 @@ class SyncEngine:
                 logger.debug("RegEx de renombrado inválida: %s", exc)
 
         # {ruta_relativa}: sub-ruta desde el origen hasta la carpeta del archivo
-        # Ej: origen=C:\temp\folder1, archivo=C:\temp\folder1\folder2\img.jpg → "folder1/folder2"
         ruta_relativa = ""
         if origen_base is not None:
             try:
@@ -199,21 +198,43 @@ class SyncEngine:
                 ruta_relativa = archivo.parent.name
 
         tokens = {
-            "{nombre_origen}": nombre_base, "{secuencial}": f"{secuencial:04d}",
-            "{fecha_fichero}": f_mtime.strftime("%Y_%m_%d"), "{año}": f_mtime.strftime("%Y"),
-            "{mes}": f_mtime.strftime("%m"), "{dia}": f_mtime.strftime("%d"),
-            "{fecha_actual}": f_actual.strftime("%Y_%m_%d"), "{directorio}": archivo.parent.name,
-            "{usuario}": getpass.getuser(), "{equipo}": socket.gethostname(),
-            "{source_name}": nombre_base, "{sequential}": f"{secuencial:04d}",
-            "{file_date}": f_mtime.strftime("%Y_%m_%d"), "{year}": f_mtime.strftime("%Y"),
-            "{month}": f_mtime.strftime("%m"), "{day}": f_mtime.strftime("%d"),
-            "{current_date}": f_actual.strftime("%Y_%m_%d"), "{root_folder}": archivo.parent.name,
-            "{ruta_relativa}": ruta_relativa, "{relative_path}": ruta_relativa,
+            # Tokens en español
+            "{nombre_origen}": nombre_base,
+            "{secuencial}": f"{secuencial:04d}",
+            "{fecha_fichero}": f_mtime.strftime("%Y_%m_%d"),
+            "{año}": f_mtime.strftime("%Y"),
+            "{ano}": f_mtime.strftime("%Y"),      # alias sin tilde (robustez codificación)
+            "{mes}": f_mtime.strftime("%m"),
+            "{dia}": f_mtime.strftime("%d"),
+            "{fecha_actual}": f_actual.strftime("%Y_%m_%d"),
+            "{directorio}": archivo.parent.name,
+            "{usuario}": getpass.getuser(),
+            "{equipo}": socket.gethostname(),
+            "{ruta_relativa}": ruta_relativa,
+            # Alias en inglés
+            "{source_name}": nombre_base,
+            "{sequential}": f"{secuencial:04d}",
+            "{file_date}": f_mtime.strftime("%Y_%m_%d"),
+            "{year}": f_mtime.strftime("%Y"),
+            "{month}": f_mtime.strftime("%m"),
+            "{day}": f_mtime.strftime("%d"),
+            "{current_date}": f_actual.strftime("%Y_%m_%d"),
+            "{root_folder}": archivo.parent.name,
+            "{relative_path}": ruta_relativa,
         }
 
         resultado = patron
         for token, valor in tokens.items():
             resultado = resultado.replace(token, str(valor))
+
+        # ── CORRECCIÓN: eliminar cualquier {token} que quedase sin sustituir.
+        # Sin esto, un token desconocido o con typo se convierte en nombre
+        # de carpeta literal con el carácter { en el sistema de ficheros.
+        resultado = re.sub(r'\{[^/}\s]+\}', '', resultado)
+
+        # Limpiar separadores duplicados que puedan haber quedado tras el strip
+        resultado = re.sub(r'/+', '/', resultado).strip('/')
+
         return _INVALID_NAME_CHARS_RE.sub("", resultado).strip()
 
     def _siguiente_secuencial(self, carpeta_destino: Path, patron_base: str,
@@ -346,27 +367,40 @@ class SyncEngine:
         try:
             ext = archivo.suffix.lower()
             patron_global = self.cfg.patron_renombrado
-            nombre_evaluado = self.resolver_nombre_dinamico(
-                patron_global, archivo, 1,
-                self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza,
-                origen_base=self.origen,
-            )
 
-            if "/" in nombre_evaluado:
-                partes = nombre_evaluado.split("/")
-                carpeta_destino = self.destino / "/".join(partes[:-1])
-                patron_solo_archivo = partes[-1]
+            # ── BUG FIX: separar el patrón RAW (antes de resolver) ──────────
+            # Si lo resolvemos completo primero, {secuencial} queda sustituido
+            # por "0001" en patron_solo_archivo y num_secuencial se ignora.
+            patron_norm = patron_global.replace("\\", "/")
+            if "/" in patron_norm:
+                partes_patron     = patron_norm.split("/")
+                patron_directorio = "/".join(partes_patron[:-1])
+                patron_archivo    = partes_patron[-1]
+            else:
+                patron_directorio = ""
+                patron_archivo    = patron_norm
+
+            # Resolver solo la parte de directorio (seq=0, no importa)
+            if patron_directorio:
+                dir_evaluado = self.resolver_nombre_dinamico(
+                    patron_directorio, archivo, 0,
+                    self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza,
+                    origen_base=self.origen,
+                )
+                carpeta_destino = self.destino / dir_evaluado
             else:
                 carpeta_destino = self.destino
-                patron_solo_archivo = nombre_evaluado
 
             if not self.cfg.dry_run:
                 carpeta_destino.mkdir(parents=True, exist_ok=True)
 
+            # Calcular secuencial con el patrón RAW de archivo
             num_secuencial = self._siguiente_secuencial(
                 carpeta_destino, patron_global, ext, archivo)
+
+            # Resolver la parte de archivo con el secuencial correcto
             nuevo_nombre_stem = self.resolver_nombre_dinamico(
-                patron_solo_archivo, archivo, num_secuencial,
+                patron_archivo, archivo, num_secuencial,
                 self.cfg.ren_regex_busca, self.cfg.ren_regex_reemplaza,
                 origen_base=self.origen,
             )

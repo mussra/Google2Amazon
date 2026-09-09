@@ -1,23 +1,29 @@
 """
-Motor de búsqueda de duplicados: indexa archivos, calcula hashes en paralelo
-usando un pool de hilos real (no limitado a unidades físicas), agrupa por hash
-y opcionalmente por similitud perceptual de imágenes.
+Motor de búsqueda de duplicados v3 — ProcessPoolExecutor para hashing.
 
-CAMBIOS v2:
-  - Particionado por lotes: los hilos se distribuyen sobre el conjunto completo
-    de archivos, no solo por unidad de disco. Siempre se usan max_hilos hilos.
-  - Pre-filtro por tamaño: SOLO se calcula el hash de archivos cuyo tamaño
-    aparece en al menos otro archivo (candidatos reales a duplicado).
-  - Similitud perceptual de imágenes: modo "similar" con umbral de distancia
-    Hamming configurable (requiere Pillow + imagehash).
-  - Estadísticas por tipo de archivo.
+Arquitectura de concurrencia:
+  - Indexación y pre-filtro: monohilo (I/O secuencial, barato).
+  - Hashing MD5: ProcessPoolExecutor con N workers reales. Cada proceso
+    hijo tiene su propia conexión SQLite al HashCache y calcula hashes
+    sin interferencia del GIL. El proceso principal recoge los resultados
+    y actualiza _mapa_resultados bajo lock.
+  - Threshold híbrido: si los candidatos son < MIN_PROC_THRESHOLD o solo
+    hay 1 CPU disponible, cae a ThreadPoolExecutor para evitar el overhead
+    de spawn de procesos en lotes pequeños (~150ms/proceso en Windows).
+  - Cancelación: se comprueba entre futuros; los workers en vuelo terminan
+    su lote actual (máximo BATCH_SIZE archivos).
+  - phash perceptual: se sigue calculando en el proceso principal tras
+    recoger los hashes, para no depender de Pillow en los workers.
 """
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
+import multiprocessing
 import os
+import sqlite3
 import threading
 import time
 from collections import defaultdict
@@ -26,12 +32,85 @@ from pathlib import Path
 from typing import Callable
 
 from .constants import CHK_DUP, DICCIONARIO_EXTENSIONES
-from .persistence import HashCache
+from .persistence import HashCache, HASH_DB_FILE
 
 logger = logging.getLogger(__name__)
 
-_EXTS_IMAGEN = DICCIONARIO_EXTENSIONES["fotos"]
+_EXTS_IMAGEN = frozenset(DICCIONARIO_EXTENSIONES["fotos"])
 
+# Usar procesos solo si hay suficientes candidatos — por debajo de este umbral
+# el overhead de spawn supera la ganancia de paralelismo CPU real.
+MIN_PROC_THRESHOLD = 80
+# Archivos por lote enviado a cada proceso hijo.
+BATCH_SIZE = 60
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Función worker — DEBE estar al nivel de módulo para ser picklable en Windows
+# (spawn start method). No puede ser un método de clase ni un closure.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _hash_batch(
+    lote: list[tuple[str, int, float, str | None]],
+    # cada elemento: (ruta_abs, tamano, mtime, hash_en_checkpoint_o_None)
+    db_path_str: str,
+) -> list[tuple[str, int, float, str | None]]:
+    """
+    Proceso hijo: calcula hashes MD5 del lote usando SQLite propio.
+    Retorna lista de (ruta, tamano, mtime, digest|None).
+    Solo usa stdlib — sin imports relativos, sin Pillow, sin imagehash.
+    """
+    conn: sqlite3.Connection | None = None
+    resultados: list[tuple[str, int, float, str | None]] = []
+    try:
+        conn = sqlite3.connect(db_path_str, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+
+        for ruta, tamano, mtime, hash_cached in lote:
+            digest = hash_cached  # ya teníamos del checkpoint
+
+            if not digest:
+                # 1. Buscar en SQLite
+                row = conn.execute(
+                    "SELECT mtime, size, hash FROM cache_hashes WHERE path=?",
+                    (ruta,),
+                ).fetchone()
+                if row and abs(row[0] - mtime) < 0.01 and row[1] == tamano:
+                    digest = row[2]
+                else:
+                    # 2. Calcular
+                    try:
+                        hasher = hashlib.md5()
+                        with open(ruta, "rb") as f:
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                hasher.update(chunk)
+                        digest = hasher.hexdigest()
+                        # Guardar en caché
+                        conn.execute(
+                            "REPLACE INTO cache_hashes (path, mtime, size, hash)"
+                            " VALUES (?, ?, ?, ?)",
+                            (ruta, mtime, tamano, digest),
+                        )
+                        conn.commit()
+                    except OSError:
+                        digest = None
+
+            resultados.append((ruta, tamano, mtime, digest))
+    except Exception as exc:
+        logger.debug("_hash_batch error: %s", exc)
+    finally:
+        if conn:
+            conn.close()
+    return resultados
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataclasses públicos
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class DuplicateOptions:
@@ -43,17 +122,15 @@ class DuplicateOptions:
     filtrar_por_tamano: bool = True
     max_hilos: int = 4
     exclusiones: list[str] = field(default_factory=list)
-    # Similitud perceptual: "exact" | "similar"
-    modo_similitud: str = "exact"
-    # Umbral distancia Hamming para modo "similar" (0-64); recomendado 8-12
-    umbral_similitud: int = 10
+    modo_similitud: str = "exact"   # "exact" | "similar"
+    umbral_similitud: int = 10      # Hamming distance threshold
 
 
 @dataclass
 class FileNode:
     path: str
     size: int
-    phash: str | None = None   # hash perceptual (solo imágenes, modo similar)
+    phash: str | None = None
 
 
 ThreadStatusCallback = Callable[[str, str], None]
@@ -61,33 +138,33 @@ ConsoleCallback = Callable[[str], None]
 
 
 def _compute_phash(ruta: Path) -> str | None:
-    """Hash perceptual MD5-like usando imagehash. Retorna hex string o None."""
     try:
         import imagehash
         from PIL import Image
-        img = Image.open(ruta)
-        return str(imagehash.phash(img))
+        return str(imagehash.phash(Image.open(ruta)))
     except Exception as exc:
         logger.debug("phash fallido en %s: %s", ruta, exc)
         return None
 
 
 def _phash_distance(h1: str, h2: str) -> int:
-    """Distancia Hamming entre dos strings hex de phash."""
     try:
         import imagehash
         return imagehash.hex_to_hash(h1) - imagehash.hex_to_hash(h2)
     except Exception:
-        return 64  # máximo = totalmente distintos
+        return 64
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Motor principal
+# ──────────────────────────────────────────────────────────────────────────────
 
 class DuplicateEngine:
-    """Escaneo concurrente y detección de duplicados exactos y similares."""
-
     def __init__(self, hash_cache: HashCache | None = None,
                  checkpoint_path: Path = CHK_DUP):
         self.hash_cache = hash_cache or HashCache()
         self.checkpoint_path = checkpoint_path
+        self.db_path_str = str(self.hash_cache.db_path)
 
         self._cancelado = threading.Event()
         self._lock = threading.Lock()
@@ -101,27 +178,19 @@ class DuplicateEngine:
     def _esta_cancelado(self) -> bool:
         return self._cancelado.is_set()
 
-    # ------------------------------------------------------------------
-    # Clasificación de extensiones
-    # ------------------------------------------------------------------
     def _clasificar_extension(self, ext: str, opts: DuplicateOptions) -> bool:
-        if ext in DICCIONARIO_EXTENSIONES["fotos"]:
-            return opts.incluir_fotos
-        if ext in DICCIONARIO_EXTENSIONES["videos"]:
-            return opts.incluir_videos
-        if ext in DICCIONARIO_EXTENSIONES["documentos"]:
-            return opts.incluir_docs
+        if ext in DICCIONARIO_EXTENSIONES["fotos"]:    return opts.incluir_fotos
+        if ext in DICCIONARIO_EXTENSIONES["videos"]:   return opts.incluir_videos
+        if ext in DICCIONARIO_EXTENSIONES["documentos"]: return opts.incluir_docs
         return opts.incluir_otros
 
     # ------------------------------------------------------------------
-    # Indexación completa → lista plana de (ruta, tamaño)
+    # Indexación → lista plana de (ruta_abs, tamano)
     # ------------------------------------------------------------------
     def _indexar_archivos(self, rutas_origen: list[str],
                            opts: DuplicateOptions) -> list[tuple[str, int]]:
-        """Recorre el árbol y devuelve lista plana de (path, size)."""
         resultado: list[tuple[str, int]] = []
         exclusiones = [e.lower() for e in opts.exclusiones if e]
-
         for ruta_base in rutas_origen:
             if not os.path.exists(ruta_base):
                 continue
@@ -136,29 +205,25 @@ class DuplicateEngine:
                         ext = Path(ruta_completa).suffix.lower()
                         if not self._clasificar_extension(ext, opts):
                             continue
-                        stat = os.stat(ruta_completa)
-                        if stat.st_size <= 0:
+                        sz = os.stat(ruta_completa).st_size
+                        if sz <= 0:
                             continue
-                        resultado.append((ruta_completa, stat.st_size))
+                        resultado.append((ruta_completa, sz))
                         with self._lock:
                             self._stats[ext] += 1
-                    except OSError as exc:
-                        logger.debug("No se pudo procesar %s: %s", ruta_completa, exc)
+                    except OSError:
+                        pass
         return resultado
 
-    # ------------------------------------------------------------------
-    # Pre-filtro por tamaño: descartar únicos antes de hashear
-    # ------------------------------------------------------------------
     @staticmethod
     def _filtrar_candidatos(archivos: list[tuple[str, int]]) -> list[tuple[str, int]]:
-        """Retorna solo archivos cuyo tamaño aparece en ≥2 ficheros."""
         conteo: dict[int, int] = defaultdict(int)
         for _, sz in archivos:
             conteo[sz] += 1
         return [(p, sz) for p, sz in archivos if conteo[sz] >= 2]
 
     # ------------------------------------------------------------------
-    # Registro en resultados (con llave compuesta opcional)
+    # Registro de resultados (hilo principal, bajo lock)
     # ------------------------------------------------------------------
     def _registrar(self, ruta: str, tamano: int, digest: str,
                     opts: DuplicateOptions, phash: str | None = None) -> None:
@@ -167,87 +232,125 @@ class DuplicateEngine:
             llave += f"_N_{os.path.basename(ruta)}"
         if opts.filtrar_por_tamano:
             llave += f"_T_{tamano}"
-        nodo = FileNode(path=ruta, size=tamano, phash=phash)
-        self._mapa_resultados.setdefault(llave, []).append(nodo)
+        self._mapa_resultados.setdefault(llave, []).append(
+            FileNode(path=ruta, size=tamano, phash=phash))
 
     # ------------------------------------------------------------------
-    # Trabajador de lote (hilo individual)
+    # Hashing con ProcessPoolExecutor (o fallback a threads)
     # ------------------------------------------------------------------
-    def _trabajador_lote(self, nombre_hilo: str, lote: list[tuple[str, int]],
-                          opts: DuplicateOptions,
-                          on_thread_status: ThreadStatusCallback) -> None:
-        total = len(lote)
-        for idx, (ruta, tamano) in enumerate(lote):
-            if self._esta_cancelado():
-                on_thread_status(nombre_hilo, "🛑 Cancelado.")
-                return
-
-            porcentaje = int((idx / total) * 100) if total else 100
-            on_thread_status(nombre_hilo, f"[{porcentaje}%] {os.path.basename(ruta)}")
-
+    def _ejecutar_hashing(
+        self,
+        candidatos: list[tuple[str, int]],
+        opts: DuplicateOptions,
+        on_console: ConsoleCallback,
+        on_thread_status: ThreadStatusCallback,
+    ) -> None:
+        """
+        Despacha los candidatos a workers (procesos o hilos según umbral),
+        recoge resultados en el hilo principal y actualiza _mapa_resultados.
+        """
+        # Preparar entradas enriquecidas con mtime + hash del checkpoint
+        entradas: list[tuple[str, int, float, str | None]] = []
+        for ruta, tamano in candidatos:
             try:
-                path_obj = Path(ruta)
-                stat = path_obj.stat()
-                mtime = stat.st_mtime
+                mtime = Path(ruta).stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            entrada_chk = self._checkpoint_data.get(ruta)
+            hash_chk = None
+            if (entrada_chk
+                    and entrada_chk.get("size") == tamano
+                    and abs(entrada_chk.get("mtime", 0) - mtime) < 0.01):
+                hash_chk = entrada_chk.get("hash")
+            entradas.append((ruta, tamano, mtime, hash_chk))
 
-                # Intentar usar checkpoint
-                with self._lock:
-                    entrada_cache = self._checkpoint_data.get(ruta)
-                hash_existente = None
-                if (entrada_cache
-                        and entrada_cache.get("size") == tamano
-                        and entrada_cache.get("mtime") == mtime):
-                    hash_existente = entrada_cache.get("hash")
+        n_cpu = max(1, multiprocessing.cpu_count())
+        n_workers = max(1, min(opts.max_hilos, n_cpu, len(candidatos)))
+        usar_procesos = (
+            len(candidatos) >= MIN_PROC_THRESHOLD
+            and n_cpu > 1
+        )
 
-                if hash_existente:
-                    phash = entrada_cache.get("phash") if entrada_cache else None
+        # Partir en lotes de BATCH_SIZE archivos
+        lotes: list[list[tuple[str, int, float, str | None]]] = [
+            entradas[i:i + BATCH_SIZE]
+            for i in range(0, len(entradas), BATCH_SIZE)
+        ]
+
+        modo_str = "procesos" if usar_procesos else "hilos"
+        on_console(
+            f"⚡ Hashing con {n_workers} {modo_str} reales "
+            f"({len(lotes)} lotes × {BATCH_SIZE} archivos, "
+            f"GIL {'bypassado' if usar_procesos else 'activo'})...\n"
+        )
+
+        Executor = (
+            concurrent.futures.ProcessPoolExecutor
+            if usar_procesos
+            else concurrent.futures.ThreadPoolExecutor
+        )
+
+        db = self.db_path_str
+        procesados = 0
+        total = len(entradas)
+
+        with Executor(max_workers=n_workers) as executor:
+            futuros = {
+                executor.submit(_hash_batch, lote, db): i
+                for i, lote in enumerate(lotes)
+            }
+            for futuro in concurrent.futures.as_completed(futuros):
+                if self._esta_cancelado():
+                    # Cancelar futuros aún no iniciados
+                    for f in futuros:
+                        f.cancel()
+                    on_console("🛑 Hashing cancelado.\n")
+                    return
+
+                num_lote = futuros[futuro]
+                try:
+                    resultados: list[tuple[str, int, float, str | None]] = futuro.result()
+                except Exception as exc:
+                    logger.warning("Lote %d falló: %s", num_lote, exc)
+                    continue
+
+                # Recoger resultados en el hilo principal (sin GIL aquí)
+                for ruta, tamano, mtime, digest in resultados:
+                    procesados += 1
+                    if not digest:
+                        continue
+
+                    # Calcular phash en el proceso principal (Pillow no en workers)
+                    phash: str | None = None
+                    ext = Path(ruta).suffix.lower()
+                    if opts.modo_similitud == "similar" and ext in _EXTS_IMAGEN:
+                        phash = _compute_phash(Path(ruta))
+
                     with self._lock:
-                        self._registrar(ruta, tamano, hash_existente, opts, phash)
-                    continue
+                        self._checkpoint_data[ruta] = {
+                            "size": tamano, "mtime": mtime,
+                            "hash": digest, "phash": phash,
+                        }
+                        self._registrar(ruta, tamano, digest, opts, phash)
 
-                # Calcular hash MD5
-                digest = self.hash_cache._compute_hash(
-                    path_obj, 65536, self._esta_cancelado)
-                if not digest:
-                    continue
-
-                # Hash perceptual para imágenes en modo similar
-                phash: str | None = None
-                ext = path_obj.suffix.lower()
-                if opts.modo_similitud == "similar" and ext in _EXTS_IMAGEN:
-                    phash = _compute_phash(path_obj)
-
-                with self._lock:
-                    self._checkpoint_data[ruta] = {
-                        "size": tamano, "mtime": mtime,
-                        "hash": digest, "phash": phash,
-                    }
-                    self._registrar(ruta, tamano, digest, opts, phash)
-
-            except OSError as exc:
-                logger.debug("Error analizando %s: %s", ruta, exc)
-
-        on_thread_status(nombre_hilo, "✅ Finalizado.")
+                pct = int(procesados / total * 100) if total else 100
+                on_thread_status(
+                    f"Pool ({modo_str})",
+                    f"[{pct}%] {procesados}/{total} archivos hasheados",
+                )
 
     # ------------------------------------------------------------------
-    # Agrupación por similitud perceptual (post-proceso)
+    # Similitud perceptual (post-proceso, monohilo)
     # ------------------------------------------------------------------
     def _agrupar_similares(self, duplicados_exactos: dict[str, list[FileNode]],
                             umbral: int) -> dict[str, list[FileNode]]:
-        """Fusiona grupos de imágenes cuya distancia Hamming ≤ umbral."""
-        # Recopilar todos los nodos con phash que NO ya son duplicados exactos
         nodos_con_phash: list[FileNode] = []
         for nodos in duplicados_exactos.values():
-            for n in nodos:
-                if n.phash:
-                    nodos_con_phash.append(n)
-
-        # También incluir singletons que podrían ser similares a otros
+            nodos_con_phash.extend(n for n in nodos if n.phash)
         for nodos in self._mapa_resultados.values():
             if len(nodos) == 1 and nodos[0].phash:
                 nodos_con_phash.append(nodos[0])
 
-        # Union-Find simple para agrupar similares
         parent: dict[str, str] = {n.path: n.path for n in nodos_con_phash}
 
         def find(x: str) -> str:
@@ -258,7 +361,6 @@ class DuplicateEngine:
 
         phash_map = {n.path: n.phash for n in nodos_con_phash if n.phash}
         paths = list(phash_map.keys())
-
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
                 if _phash_distance(phash_map[paths[i]], phash_map[paths[j]]) <= umbral:
@@ -266,27 +368,29 @@ class DuplicateEngine:
                     if ra != rb:
                         parent[rb] = ra
 
-        grupos_similares: dict[str, list[FileNode]] = defaultdict(list)
+        grupos: dict[str, list[FileNode]] = defaultdict(list)
         path_map = {n.path: n for n in nodos_con_phash}
         for p in paths:
-            grupos_similares[find(p)].append(path_map[p])
+            grupos[find(p)].append(path_map[p])
 
         resultado = dict(duplicados_exactos)
-        for rep, nodos in grupos_similares.items():
+        for rep, nodos in grupos.items():
             if len(nodos) >= 2:
-                llave_sim = f"SIMILAR_{rep}"
-                if llave_sim not in resultado:
-                    resultado[llave_sim] = nodos
+                llave = f"SIMILAR_{rep}"
+                if llave not in resultado:
+                    resultado[llave] = nodos
         return resultado
 
     # ------------------------------------------------------------------
     # API pública
     # ------------------------------------------------------------------
-    def buscar_duplicados(self, rutas_origen: list[str], opts: DuplicateOptions,
-                           on_console: ConsoleCallback,
-                           on_thread_status: ThreadStatusCallback
-                           ) -> tuple[dict[str, list[FileNode]], dict]:
-        """Ejecuta escaneo (llamar desde hilo de fondo). Retorna (duplicados, métricas)."""
+    def buscar_duplicados(
+        self,
+        rutas_origen: list[str],
+        opts: DuplicateOptions,
+        on_console: ConsoleCallback,
+        on_thread_status: ThreadStatusCallback,
+    ) -> tuple[dict[str, list[FileNode]], dict]:
         self._cancelado.clear()
         self._mapa_resultados = {}
         self._stats = defaultdict(int)
@@ -295,48 +399,25 @@ class DuplicateEngine:
         t_inicio = time.time()
         on_console("🔍 Indexando archivos...\n")
 
-        todos_los_archivos = self._indexar_archivos(rutas_origen, opts)
-        total_indexados = len(todos_los_archivos)
+        todos = self._indexar_archivos(rutas_origen, opts)
+        total_indexados = len(todos)
 
-        on_console(f"📊 Indexados: {total_indexados} archivos. Aplicando pre-filtro por tamaño...\n")
-        candidatos = self._filtrar_candidatos(todos_los_archivos)
+        on_console(f"📊 {total_indexados} archivos. Pre-filtro por tamaño...\n")
+        candidatos = self._filtrar_candidatos(todos)
         descartados = total_indexados - len(candidatos)
         on_console(
-            f"✅ Pre-filtro: {len(candidatos)} candidatos a duplicado "
-            f"({descartados} descartados por tamaño único — sin hash calculado).\n"
+            f"✅ {len(candidatos)} candidatos "
+            f"({descartados} descartados — tamaño único, sin hash).\n"
         )
 
         if not candidatos:
-            on_console("❌ No hay candidatos a duplicado tras el pre-filtro.\n")
-            return {}, {"ficheros": total_indexados, "directorios": len(rutas_origen),
-                        "tiempo_ms": 0.0, "stats": dict(self._stats)}
+            on_console("❌ Sin candidatos tras el pre-filtro.\n")
+            return {}, {
+                "ficheros": total_indexados, "directorios": len(rutas_origen),
+                "tiempo_ms": 0.0, "stats": dict(self._stats),
+            }
 
-        # Particionado por lotes para garantizar N hilos activos
-        n_hilos = max(1, min(opts.max_hilos, len(candidatos)))
-        lote_size = max(1, len(candidatos) // n_hilos)
-        lotes = [candidatos[i:i + lote_size] for i in range(0, len(candidatos), lote_size)]
-        # Si el particionado generó más lotes que hilos (resto), fusionar el último
-        while len(lotes) > n_hilos:
-            lotes[-2].extend(lotes[-1])
-            lotes.pop()
-
-        on_console(
-            f"⚡ Lanzando {len(lotes)} hilos sobre {len(candidatos)} candidatos "
-            f"({lote_size} archivos/hilo aprox.)...\n"
-        )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_hilos) as executor:
-            futuros = [
-                executor.submit(
-                    self._trabajador_lote,
-                    f"Hilo {i + 1}",
-                    lote,
-                    opts,
-                    on_thread_status,
-                )
-                for i, lote in enumerate(lotes)
-            ]
-            concurrent.futures.wait(futuros)
+        self._ejecutar_hashing(candidatos, opts, on_console, on_thread_status)
 
         if not self._esta_cancelado():
             self._guardar_checkpoint()
@@ -345,10 +426,10 @@ class DuplicateEngine:
             k: v for k, v in self._mapa_resultados.items() if len(v) > 1
         }
 
-        # Similitud perceptual (post-proceso, monohilo)
         if opts.modo_similitud == "similar":
-            on_console("🖼️ Calculando similitud perceptual de imágenes...\n")
-            duplicados_final = self._agrupar_similares(duplicados_exactos, opts.umbral_similitud)
+            on_console("🖼️ Agrupando similares (Union-Find)...\n")
+            duplicados_final = self._agrupar_similares(
+                duplicados_exactos, opts.umbral_similitud)
         else:
             duplicados_final = duplicados_exactos
 
@@ -374,23 +455,22 @@ class DuplicateEngine:
             logger.warning("No se pudo eliminar %s: %s", ruta_abs, exc)
             return 0
         except ImportError:
-            logger.error("send2trash no instalado; no se pudo enviar a papelera %s", ruta_abs)
+            logger.error("send2trash no instalado: %s", ruta_abs)
             return 0
 
     def exportar_csv(self, duplicados: dict[str, list[FileNode]], ruta_csv: str) -> bool:
-        """Exporta el informe de duplicados a CSV. Mejora #3."""
         import csv
         try:
             with open(ruta_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Grupo", "Archivo", "Ruta", "Tamaño_MB", "Tipo", "Hash_Perceptual"])
+                w = csv.writer(f)
+                w.writerow(["Grupo", "Archivo", "Ruta", "Tamaño_MB", "Tipo", "Hash_Perceptual"])
                 for idx, (llave, nodos) in enumerate(duplicados.items(), 1):
                     tipo = "SIMILAR" if llave.startswith("SIMILAR_") else "EXACTO"
                     for nodo in nodos:
                         p = Path(nodo.path)
-                        writer.writerow([
+                        w.writerow([
                             idx, p.name, str(p.parent),
-                            f"{nodo.size / (1024*1024):.3f}",
+                            f"{nodo.size/(1024*1024):.3f}",
                             tipo, nodo.phash or "",
                         ])
             return True
@@ -408,12 +488,18 @@ class DuplicateEngine:
             with open(self.checkpoint_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Checkpoint de duplicados ilegible: %s", exc)
+            logger.warning("Checkpoint ilegible: %s", exc)
             return {}
 
     def _guardar_checkpoint(self) -> None:
+        tmp = self.checkpoint_path.with_suffix(".tmp")
         try:
-            with open(self.checkpoint_path, "w", encoding="utf-8") as f:
-                json.dump(self._checkpoint_data, f, indent=4)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._checkpoint_data, f, indent=2)
+            os.replace(tmp, self.checkpoint_path)
         except OSError as exc:
             logger.warning("No se pudo guardar checkpoint: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
